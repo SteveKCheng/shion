@@ -62,6 +62,7 @@ impl<T> Default for WireCodec<T> {
     }
 }
 
+/// Adapts shion-wire's [`Wire`] trait to Tokio's [`Decoder`] trait.
 impl<T: Wire> Decoder for WireCodec<T> {
     type Item = T;
     type Error = CodecError;
@@ -92,6 +93,7 @@ impl<T: Wire> Decoder for WireCodec<T> {
     }
 }
 
+/// Adapts shion-wire's [`Wire`] trait to Tokio's [`Encoder`] trait.
 impl<T: Wire> Encoder<T> for WireCodec<T> {
     type Error = CodecError;
 

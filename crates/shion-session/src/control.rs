@@ -16,11 +16,17 @@ use crate::state::State;
 
 /// Runs a conversation from `CONV_OPEN` until the front-end closes the
 /// control stream.
+/// 
+/// Each "conversation", i.e. a high-level SSH connection from the end user's point of view,
+/// is associated with exactly one control stream.  This function will register the new
+/// conversation, mapped by its ID.
 pub async fn run(
     mut framed: Framed<Stream, ControlCodec>,
     open: ConvOpen,
     state: Arc<State>,
 ) -> Result<(), CodecError> {
+
+    // Register the newly opened conversation into this session process's global state.
     let id = open.conversation_id;
     let _registration = match state.register(open) {
         Ok(registration) => registration,
@@ -30,9 +36,11 @@ pub async fn run(
             return framed.close().await;
         }
     };
+
     info!(conversation = id, "conversation opened");
     framed.send(ControlMessage::ConvAccept(accept())).await?;
 
+    // Dispatch messages from the control stream
     while let Some(msg) = framed.next().await {
         match msg? {
             ControlMessage::GlobalRequest {
@@ -59,15 +67,21 @@ pub async fn run(
     // `_registration` is dropped here, which unregisters the conversation.
 }
 
+/// Creates the `ConvAccept` message that we send back to the front-end process.
 fn accept() -> ConvAccept {
-    // Every request we can parse, minus the two that only flow from us to
-    // the client. Requests we parse but don't support (yet) get a polite
-    // CHANNEL_FAILURE instead of killing the channel.
+
+    // Report for the front-end process, all the request types that this session 
+    // process can parse (from the client), minus the two that only flow from this process 
+    // back to the client. 
+    //
+    // Requests that we parse but don't support (yet) get a polite CHANNEL_FAILURE instead 
+    // of killing the channel.
     let request_types = request_type::ALL
         .iter()
         .filter(|&&t| t != request_type::EXIT_STATUS && t != request_type::EXIT_SIGNAL)
         .map(|&t| t.to_owned())
         .collect();
+
     ConvAccept {
         version: PROTOCOL_VERSION,
         channel_types: vec![channel_type::SESSION.to_owned()],

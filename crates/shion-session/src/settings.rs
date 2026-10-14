@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-/// shion's per-user session process.
+/// Global settings for shion's per-user session process,
+/// passed in from the command line.
 ///
 /// Speaks smux-multiplexed SSH3 channels on stdin/stdout, and is normally
 /// started by the shion front-end inside a bwrap sandbox. Logs go to

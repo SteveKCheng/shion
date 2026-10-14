@@ -8,6 +8,8 @@ use shion_wire::control::{PROTOCOL_VERSION, attr};
 
 use crate::settings::Settings;
 
+/// The session process's global state.
+///
 /// Shared through an `Arc` (an atomically reference-counted pointer, like
 /// `std::shared_ptr`). The conversation table needs a `Mutex` because
 /// several tasks, possibly on different threads, use it. Rust won't compile
@@ -26,9 +28,10 @@ impl State {
         })
     }
 
-    /// Validates a `CONV_OPEN` and records the conversation. The returned
-    /// [`Registration`] removes it again when dropped. On failure, returns
-    /// the reason to send in `CONV_REJECT`.
+    /// Validates a `CONV_OPEN` and records the conversation. 
+    /// 
+    /// The returned [`Registration`] removes it again when dropped. On failure, 
+    /// returns the reason to send in `CONV_REJECT`.
     ///
     /// `self: &Arc<Self>` lets the method keep its own reference to the
     /// state (for the `Registration`), not just borrow it for the call.
@@ -61,6 +64,7 @@ impl State {
         self.table().get(&id).cloned()
     }
 
+    /// Access the table of all conversations, locking it for the duration of access.
     fn table(&self) -> MutexGuard<'_, HashMap<u64, Arc<ConvOpen>>> {
         // A lock is "poisoned" if a thread panicked while holding it. Every
         // update of this table is a single insert or remove, so it can't be
@@ -71,10 +75,12 @@ impl State {
     }
 }
 
-/// Proof that a conversation is registered. Dropping it unregisters the
-/// conversation, however the owning task ends: normal return, `?` error,
-/// or panic. This is RAII, as in C++, except that the compiler also stops
-/// you from using the guard after it has been moved or dropped.
+/// Proof that a conversation is registered. 
+/// 
+/// Dropping it unregisters the conversation, however the owning task ends: 
+/// normal return, `?` error, or panic. This is RAII, as in C++, except that 
+/// the compiler also stops you from using the guard after it has been moved 
+/// or dropped.
 #[derive(Debug)]
 pub struct Registration {
     state: Arc<State>,

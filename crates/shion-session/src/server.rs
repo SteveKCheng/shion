@@ -18,6 +18,9 @@ use crate::{channel, control};
 pub type Stream = shion_mux::Stream<Carrier>;
 
 /// Serves the front-end until the carrier closes.
+///
+/// Each stream opened by the front-end inside `carrier` will be dispatched
+/// to the appropriate handler.
 pub async fn serve(carrier: Carrier, state: Arc<State>) {
     // The front-end is the smux "client" (odd stream IDs); we're the
     // "server" (even IDs, which we'll need for forwarded-tcpip in M4).
@@ -44,15 +47,18 @@ pub async fn serve(carrier: Carrier, state: Arc<State>) {
     }
 }
 
-/// Reads the first message to find out what kind of stream this is.
+/// Reads the first message of a stream to find out what kind it is, 
+/// then dispatches to the appropriate handler for the stream.
 async fn handle_stream(stream: Stream, state: Arc<State>) -> Result<(), CodecError> {
     let mut framed = Framed::new(stream, StreamStartCodec::default());
+
     // `transpose` turns Option<Result<T, E>> into Result<Option<T>, E>, so
     // `?` can take care of the error and `let … else` of the `None`.
     let Some(start) = framed.next().await.transpose()? else {
         debug!("stream closed before its first message");
         return Ok(());
     };
+
     // `map_codec` swaps the codec but keeps any bytes already read past the
     // first message.
     match start {

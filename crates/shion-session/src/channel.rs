@@ -192,7 +192,15 @@ async fn setup(
     Ok(None)
 }
 
-/// Starts `command` (or a login shell) with a fresh environment.
+/// Executes a command with a fresh environment.
+/// 
+/// `command` is the string to pass to the shell via its `-c` option.
+/// If `None`, then an (interactive) log-in shell is spawned.
+///
+/// Note: There is no SSH request to launch a program executable directly
+/// with an argument vector.
+/// 
+/// `stdin`, `stdout`, and `stderr` for the child process are pipes.
 fn spawn(
     settings: &Settings,
     conversation: &ConvOpen,
@@ -215,12 +223,15 @@ fn spawn(
         }
     };
 
+    // Default environment variables; possibly overridden below.
     cmd.env_clear()
         .env("HOME", &settings.home)
         .env("USER", &settings.user)
         .env("LOGNAME", &settings.user)
         .env("SHELL", &settings.shell)
         .env("PATH", DEFAULT_PATH);
+
+    // SSH-specific environment variables
     if let (Some(client), Some(server)) = (
         conversation.attribute(attr::CLIENT_ADDRESS),
         conversation.attribute(attr::SERVER_ADDRESS),
@@ -231,6 +242,8 @@ fn spawn(
             cmd.env("SSH_CLIENT", format!("{client} {server_port}"));
         }
     }
+
+    // Apply user-supplied overrides/additions to environment variables
     cmd.envs(settings.env.iter().map(|(name, value)| (name, value)));
 
     cmd.current_dir(&settings.home)
@@ -263,9 +276,14 @@ async fn supervise(
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
 
+    // Begin pump for the child process's stdin
     let (input, input_rx) = mpsc::channel(16);
-    let mut input = Some(input);
+    let mut input = Some(input);    // for dropping `input` early
     tokio::spawn(pump_input(input_rx, stdin));
+
+    // Begin pumps for the child process's stdout and stderr.
+    // Data for stderr is distinguished from stdout, in the SSH protocol,
+    // by setting 'EXTENDED_DATA_ERROR` as the data type.
     let stdout_pump = tokio::spawn(pump_output(stdout, out.clone(), None, packet_size));
     let stderr_pump = tokio::spawn(pump_output(
         stderr,
@@ -274,15 +292,20 @@ async fn supervise(
         packet_size,
     ));
 
+    // Future that completes when the child exits (normally or terminated by a signal).
+    //
+    // Furthermore, wait for any remaining data in output pipes, which might have be 
+    // written to by a descendant process that inherited those pipes, to drain.
+    //
+    // OpenSSH waits for the output pipes too, which can be observed by running 
+    // `ssh host 'sleep 60 &'`: it will hang for a full minute.
     let finished = async move {
         let status = child.wait().await;
-        // The child is gone, but output may still be in the pipes. Like
-        // OpenSSH, we also wait for any background process that inherited
-        // them (`ssh host 'sleep 60 &'` hangs for a minute there too).
         let _ = stdout_pump.await;
         let _ = stderr_pump.await;
         status
     };
+
     // `select!` polls `finished` repeatedly through a reference, so it must
     // stay at a fixed address: `pin!` guarantees that.
     let mut finished = std::pin::pin!(finished);
@@ -324,7 +347,12 @@ async fn supervise(
     }
 }
 
-/// Copies data from the channel into the child's stdin.
+/// Continuously copies data into the child process's stdin.
+/// 
+/// `rx` is the queue where the SSH message parser pushes data to pump
+/// into the child process.
+/// 
+/// Copying stops when `rx` is closed, or writing to the child fails.
 async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: ChildStdin) {
     while let Some(data) = rx.recv().await {
         if let Err(e) = stdin.write_all(&data).await {
@@ -335,8 +363,19 @@ async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: ChildStdin) {
     // `stdin` is dropped here, closing the pipe: the child reads EOF.
 }
 
-/// Copies the child's stdout or stderr to the channel, in chunks of at most
-/// `packet_size`.
+/// Continually copies the child's stdout or stderr to put into the
+/// relevant SSH channel, in chunks of at most `packet_size`.
+/// 
+/// Copying stops when the child's stream reaches end-of-file, 
+/// or the receiving channel for that output has been closed,
+/// or some other error is encountered.
+/// 
+/// The payload bytes are wrapped in either a `SSH_MSG_CHANNEL_DATA` or
+/// `SSH_MSG_CHANNEL_EXTENDED_DATA` message.  If `data_type` is not None,
+/// that will be the data type code inside `SSH_MSG_CHANNEL_EXTENDED_DATA`.
+/// 
+/// `out` is the MPSC queue where this function will push the output 
+/// SSH messages into.
 async fn pump_output(
     mut from: impl AsyncRead + Unpin,
     out: Out,
@@ -364,7 +403,12 @@ async fn pump_output(
     }
 }
 
-/// `exit-status`, or `exit-signal` if a signal killed the child.
+/// Create the SSH request message to report that a child process has exited.
+/// 
+/// The request type in the message is:
+/// 
+///   - `exit-status` when the child process has exited normally.
+///   - `exit-signal` when the child process has been terminated by a signal.
 fn exit_message(status: ExitStatus) -> Message {
     let request = match (status.code(), status.signal()) {
         (Some(code), _) => ChannelRequest::ExitStatus {

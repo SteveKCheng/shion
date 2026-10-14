@@ -37,6 +37,8 @@ async fn main() -> ExitCode {
         warn!(error = %e, "cannot clear the dumpable flag");
     }
 
+    // Pair up stdin/stdout as a single bi-directional "carrier", 
+    // i.e. it behaves like a socket stream that can be used for async-smux
     let carrier = match carrier::from_stdio() {
         Ok(carrier) => carrier,
         Err(e) => {
@@ -50,6 +52,7 @@ async fn main() -> ExitCode {
         pid = std::process::id(),
         "session process started"
     );
+    
     server::serve(carrier, State::new(settings)).await;
     ExitCode::SUCCESS
 }

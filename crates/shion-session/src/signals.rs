@@ -20,6 +20,7 @@ const SIGNALS: &[(&str, Signal)] = &[
     ("USR2", Signal::USR2),
 ];
 
+/// Maps the SSH name of a POSIX signal to a `Signal` value.
 pub fn from_name(name: &str) -> Option<Signal> {
     SIGNALS
         .iter()
