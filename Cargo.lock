@@ -475,6 +475,7 @@ dependencies = [
 name = "shion-fd"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rustix",
  "tempfile",
  "tokio",

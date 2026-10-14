@@ -10,6 +10,9 @@ publish.workspace = true
 rustix.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "net"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 rustix = { workspace = true, features = ["pipe"] }
 tempfile = "3"

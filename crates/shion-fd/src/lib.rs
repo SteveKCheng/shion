@@ -50,21 +50,22 @@ pub fn writer(fd: OwnedFd) -> io::Result<BoxedWrite> {
     })
 }
 
-/// Wraps an input fd and an output fd, which may be the same file.
+/// Wraps an input fd and an output fd, which may share one open file
+/// description.
 ///
 /// Prefer this to separate [`reader`] and [`writer`] calls for stdin and
-/// stdout. When both are one file (a terminal, or one end of a
-/// `socketpair` passed as both), they usually share one *open file
-/// description*, and with it the `O_NONBLOCK` flag. Two [`FdStream`]s on it
-/// would each remember the flags they found, and whichever was created
-/// second would "restore" `O_NONBLOCK` when dropped, leaving, say, your
-/// shell's terminal non-blocking. So in that case we wrap only `input`,
-/// which must be open for both reading and writing, and split it.
+/// stdout. They often share one *open file description* (a terminal, or
+/// one end of a `socketpair` passed as both), and with it the `O_NONBLOCK`
+/// flag. Two [`FdStream`]s on it would each remember the flags they found,
+/// and whichever was created second would "restore" `O_NONBLOCK` when
+/// dropped, leaving, say, your shell's terminal non-blocking. So in that
+/// case we wrap only `input`, which must be open for both reading and
+/// writing, and split it.
 ///
 /// # Errors
 /// As for [`reader`].
 pub fn duplex(mut input: OwnedFd, output: OwnedFd) -> io::Result<(BoxedRead, BoxedWrite)> {
-    if same_file(&input, &output)? && is_read_write(&input)? {
+    if same_description(&input, &output)? && is_read_write(&input)? {
         match FdStream::new(input)? {
             Ok(stream) => {
                 drop(output); // a duplicate we don't need
@@ -77,9 +78,55 @@ pub fn duplex(mut input: OwnedFd, output: OwnedFd) -> io::Result<(BoxedRead, Box
     Ok((reader(input)?, writer(output)?))
 }
 
-fn same_file(a: &OwnedFd, b: &OwnedFd) -> io::Result<bool> {
+/// Whether two fds share one open file description.
+fn same_description(a: &OwnedFd, b: &OwnedFd) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    match kcmp_file(a, b) {
+        Ok(same) => return Ok(same),
+        // ENOSYS: a kernel built without `kcmp`. EPERM: blocked by a
+        // seccomp filter, as in Docker's default profile. Fall back.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {}
+        Err(e) => return Err(e),
+    }
+    // Same file, which is a weaker test: fds sharing a description always
+    // refer to the same file, so it never misses a shared description, but
+    // it also matches separate opens of one file. Then we'd use `input` for
+    // output too, which works (it's open read-write) but ignores any status
+    // flags of `output`'s own description, such as `O_APPEND`.
     let (a, b) = (rustix::fs::fstat(a)?, rustix::fs::fstat(b)?);
     Ok((a.st_dev, a.st_ino) == (b.st_dev, b.st_ino))
+}
+
+/// Asks the kernel whether two of our fds share an open file description,
+/// with `kcmp(KCMP_FILE)`. Linux-only, and with no wrapper in glibc or
+/// rustix, so we make the raw system call through the `libc` crate.
+#[cfg(target_os = "linux")]
+fn kcmp_file(a: &OwnedFd, b: &OwnedFd) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    /// From `<linux/kcmp.h>`, which the `libc` crate doesn't cover.
+    const KCMP_FILE: libc::c_long = 0;
+
+    // `syscall` is variadic and the kernel reads every argument as a full
+    // register, so pass them all as `c_long`. An `i32` passed as a C
+    // variadic argument may leave the register's upper half undefined.
+    let pid = libc::c_long::from(rustix::process::getpid().as_raw_nonzero().get());
+    let (a, b) = (
+        libc::c_long::from(a.as_raw_fd()),
+        libc::c_long::from(b.as_raw_fd()),
+    );
+    #[allow(unsafe_code)]
+    // SAFETY: `kcmp` only compares kernel objects. It takes no pointers,
+    // so it can't touch our memory, and the arguments match its
+    // signature, `kcmp(pid, pid, type, idx1, idx2)`. A stale fd number
+    // would only make it fail with EBADF, and the borrows keep both open.
+    let result = unsafe { libc::syscall(libc::SYS_kcmp, pid, pid, KCMP_FILE, a, b) };
+    // 0 means equal. 1 and 2 order unequal objects, which `kcmp` offers so
+    // callers can sort them.
+    match result {
+        -1 => Err(io::Error::last_os_error()),
+        r => Ok(r == 0),
+    }
 }
 
 fn is_read_write(fd: &OwnedFd) -> io::Result<bool> {
@@ -87,23 +134,23 @@ fn is_read_write(fd: &OwnedFd) -> io::Result<bool> {
 }
 
 /// Adapts a file descriptor for async I/O in tokio's reactor.
-/// 
+///
 /// Implements both `AsyncRead` and `AsyncWrite`; whether both work depends
 /// on the FD. To read and write from different tasks, use
 /// `tokio::io::split`.
-/// 
+///
 /// The non-blocking flag `O_NONBLOCK` is set on the file descriptor,
 /// and then restored on dropping `FdStream`.
-/// 
+///
 /// However, do note that `O_NONBLOCK` belongs to the *open file description*,
-/// which is shared between cloned FDs.  In shion, the target file descriptors 
+/// which is shared between cloned FDs.  In shion, the target file descriptors
 /// are either owned by the session process, or for the stdin/stdout of the
 /// session process, which can only be reasonably assumed to be solely used
 /// by the session process. (stdin and stdout are passing binary data so any
 /// process trying to read/write to them at the same time will surely corrupt
 /// the data.)  
-/// 
-/// In case the session process is run from the terminal, etc., restoring the 
+///
+/// In case the session process is run from the terminal, etc., restoring the
 /// original file status is mostly about being nice: if the session process
 /// crashes, it is not guaranteed to restore the flags.
 #[derive(Debug)]
@@ -282,6 +329,26 @@ mod tests {
                 .unwrap()
                 .contains(OFlags::NONBLOCK)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kcmp_tells_descriptions_apart() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let first = OwnedFd::from(file.reopen().unwrap());
+        let dup = first.try_clone().unwrap(); // same description
+        let second = OwnedFd::from(file.reopen().unwrap()); // a new one
+        match kcmp_file(&first, &second) {
+            Ok(same) => assert!(!same),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {
+                eprintln!("kcmp unavailable ({e}); skipping");
+                return;
+            }
+            Err(e) => panic!("kcmp: {e}"),
+        }
+        assert!(kcmp_file(&first, &dup).unwrap());
+        assert!(same_description(&first, &dup).unwrap());
+        assert!(!same_description(&first, &second).unwrap());
     }
 
     #[tokio::test]
