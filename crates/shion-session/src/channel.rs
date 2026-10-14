@@ -21,7 +21,6 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 
@@ -199,12 +198,21 @@ fn spawn(
     conversation: &ConvOpen,
     command: Option<&[u8]>,
 ) -> io::Result<Child> {
-    let mut cmd = Command::new(&settings.shell);
+
+    let shell = &settings.shell;
+    let mut cmd = Command::new(shell);
+
+    // Set the program to execute.
     match command {
         // Unix command lines are bytes, not necessarily UTF-8.
         Some(command) => cmd.arg("-c").arg(OsStr::from_bytes(command)),
-        // A leading '-' in argv[0] tells the shell it's a login shell.
-        None => cmd.arg0(login_arg0(&settings.shell)),
+        
+        // A leading '-' in argv[0] tells the shell it's a log-in shell.
+        None => {
+            let mut arg0 = OsString::from("-");
+            arg0.push(shell.file_name().unwrap_or(shell.as_os_str()));
+            cmd.arg0(arg0)
+        }
     };
 
     cmd.env_clear()
@@ -235,12 +243,6 @@ fn spawn(
     let child = cmd.spawn()?;
     debug!(pid = child.id(), command = ?command.map(String::from_utf8_lossy), "spawned");
     Ok(child)
-}
-
-fn login_arg0(shell: &Path) -> OsString {
-    let mut arg0 = OsString::from("-");
-    arg0.push(shell.file_name().unwrap_or(shell.as_os_str()));
-    arg0
 }
 
 /// Runs the child to completion while relaying data and requests.
