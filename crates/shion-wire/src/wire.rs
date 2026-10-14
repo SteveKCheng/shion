@@ -81,7 +81,9 @@ pub fn string_len(s: impl AsRef<[u8]>) -> usize {
 /// The lifetime `'a` ties the slices returned by [`Reader::take`] to the
 /// underlying buffer, so they can be used without copying. The borrow
 /// checker then makes sure the buffer isn't modified while they're alive.
-#[derive(Debug)]
+/// It is `Clone` so a decoder can look ahead: clone the reader, read from
+/// the clone, and the original stays where it was.
+#[derive(Debug, Clone)]
 pub struct Reader<'a> {
     buf: &'a [u8],
     start_len: usize,

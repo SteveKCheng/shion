@@ -21,6 +21,7 @@ use crate::control::ControlMessage;
 use crate::error::{CodecError, DecodeError};
 use crate::header::ChannelHeader;
 use crate::message::Message;
+use crate::stream::StreamStart;
 use crate::wire::Reader;
 
 /// Default limit on the length of any single string or control message
@@ -41,6 +42,7 @@ pub struct WireCodec<T> {
 pub type HeaderCodec = WireCodec<ChannelHeader>;
 pub type MessageCodec = WireCodec<Message>;
 pub type ControlCodec = WireCodec<ControlMessage>;
+pub type StreamStartCodec = WireCodec<StreamStart>;
 
 impl<T> WireCodec<T> {
     /// A codec that rejects strings longer than `max_len` bytes.

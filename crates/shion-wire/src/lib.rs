@@ -14,6 +14,7 @@ pub mod control;
 pub mod error;
 pub mod header;
 pub mod message;
+pub mod stream;
 pub mod wire;
 
 use bytes::BytesMut;
@@ -22,6 +23,7 @@ pub use control::{ControlMessage, ConvAccept, ConvOpen};
 pub use error::{CodecError, DecodeError, EncodeError};
 pub use header::ChannelHeader;
 pub use message::{ChannelRequest, Message};
+pub use stream::StreamStart;
 pub use wire::Reader;
 
 /// A value with a wire encoding.

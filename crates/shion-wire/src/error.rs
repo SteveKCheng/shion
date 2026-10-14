@@ -32,6 +32,9 @@ pub enum DecodeError {
 
     #[error("unknown channel request type {0:?}")]
     UnknownRequest(String),
+
+    #[error("stream starts with neither a channel header nor CONV_OPEN (first value {0:#x})")]
+    UnknownStreamStart(u64),
 }
 
 /// Why a value could not be encoded.

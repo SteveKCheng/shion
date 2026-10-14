@@ -9,9 +9,19 @@ rust-version = "1.85"
 publish = false
 
 [workspace.dependencies]
+shion-mux = { path = "crates/shion-mux" }
+shion-wire = { path = "crates/shion-wire" }
+
+async_smux = "0.4"
 bytes = "1.12"
+clap = { version = "4.6", features = ["derive"] }
+futures-util = { version = "0.3", features = ["sink"] }
+rustix = { version = "1.1", features = ["fs", "process", "stdio"] }
 thiserror = "2.0"
+tokio = "1.53"
 tokio-util = { version = "0.7", features = ["codec"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -20,3 +30,4 @@ missing_debug_implementations = "warn"
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
+undocumented_unsafe_blocks = "warn"

@@ -235,6 +235,11 @@ string attributes so they read well in logs:
 Everything about the *user* comes from the session process's command line
 (§5.6).
 
+**Telling streams apart.** The session reads the first varint of every
+stream the front-end opens. `0xaf3627e6` means a channel header follows;
+192 means it's a control stream starting with CONV_OPEN. Nothing else is
+valid (`shion_wire::StreamStart`).
+
 Closing the control stream (FIN both ways) ends the conversation. The session
 then sends SIGHUP to every process group the conversation started.
 
@@ -279,6 +284,18 @@ main
  │        "direct-tcpip"    → forward::direct
  └─ SIGCHLD handled by tokio::process (per-child wait futures)
 ```
+
+**The carrier** is stdin and stdout joined with `tokio::io::join`, so the
+process doesn't assume a socket and can be driven from a shell for
+testing. Both fds are `dup`ed (close-on-exec) and registered with tokio's
+reactor through `AsyncFd`, falling back to `tokio::fs::File` for regular
+files, which epoll can't watch. (We avoid `tokio::io::stdin()` because its
+blocking read can't be cancelled.) Fds 0 and 1 are then pointed at
+`/dev/null` and stderr, so a stray `println!` can't corrupt the protocol.
+
+**async-smux workaround:** in 0.4.0, `poll_flush` fails after
+`poll_shutdown` has begun, which breaks `Framed::close`. The
+`shion_mux::Stream` wrapper fixes that (worth reporting upstream).
 
 Each channel is one tokio task that owns its stream and its child process.
 Nothing is shared between channels except a `Conversation` registry
@@ -438,8 +455,8 @@ Main dependencies: `tokio`, `tokio-util`, `bytes`, `async-smux`, `rustix`,
 
 | #  | Deliverable                                                                  | How we test it                                   |
 |----|------------------------------------------------------------------------------|--------------------------------------------------|
-| M0 | Workspace and `shion-wire` codec                                             | unit tests, sshoq vectors                        |
-| M1 | session: carrier, control stream, `exec` over pipes, `exit-status`           | integration test spawns binary, drives smux      |
+| M0 | Workspace and `shion-wire` codec (done)                                      | unit tests, sshoq vectors                        |
+| M1 | session: carrier, control stream, `exec` over pipes, `exit-status` (done)    | integration test spawns binary, drives smux      |
 | M2 | pty, `shell`, `window-change`, `signal`, terminal modes; `shion-attach`      | interactive `bash`, `vim`, resize, `^C`          |
 | M3 | subsystems (sftp), env allowlist, conversation teardown, `PR_SET_DUMPABLE`   | `sftp` via shion-attach; fd-leak test            |
 | M4 | `direct-tcpip`, `tcpip-forward` / `forwarded-tcpip`                          | curl through a forward                           |
