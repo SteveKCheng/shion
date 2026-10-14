@@ -257,21 +257,21 @@ fn spawn(
     terminal: Option<&Terminal>,
 ) -> io::Result<Child> {
     let shell = &settings.shell;
-    let mut cmd = Command::new(shell);
+    let mut prog = Command::new(shell);
 
     // Set the program to execute. 
     if let Some(command) = command {
         // Unix command lines are bytes, not necessarily UTF-8.
-        cmd.arg("-c").arg(OsStr::from_bytes(command));
+        prog.arg("-c").arg(OsStr::from_bytes(command));
     } else {
         // A leading '-' in argv[0] tells the shell it's a log-in shell.
         let mut arg0 = OsString::from("-");
         arg0.push(shell.file_name().unwrap_or(shell.as_os_str()));
-        cmd.arg0(arg0);
+        prog.arg0(arg0);
     }
 
     // Default environment variables; possibly overridden below.
-    cmd.env_clear()
+    prog.env_clear()
         .env("HOME", &settings.home)
         .env("USER", &settings.user)
         .env("LOGNAME", &settings.user)
@@ -284,39 +284,39 @@ fn spawn(
         conversation.attribute(attr::SERVER_ADDRESS),
     ) {
         // Both are "<ip> <port>", which is what these variables are made of.
-        cmd.env("SSH_CONNECTION", format!("{client} {server}"));
+        prog.env("SSH_CONNECTION", format!("{client} {server}"));
         if let Some((_, server_port)) = server.rsplit_once(' ') {
-            cmd.env("SSH_CLIENT", format!("{client} {server_port}"));
+            prog.env("SSH_CLIENT", format!("{client} {server_port}"));
         }
     }
 
     // Terminal-specific environment variables
     if let Some(terminal) = terminal {
         if !terminal.term().is_empty() {
-            cmd.env("TERM", terminal.term());
+            prog.env("TERM", terminal.term());
         }
-        cmd.env("SSH_TTY", terminal.path());
+        prog.env("SSH_TTY", terminal.path());
     }
 
     // Apply user-supplied overrides/additions to environment variables
-    cmd.envs(settings.env.iter().map(|(name, value)| (name, value)));
+    prog.envs(settings.env.iter().map(|(name, value)| (name, value)));
 
-    cmd.current_dir(&settings.home);
+    prog.current_dir(&settings.home);
 
     // Configure I/O to child process.
     if let Some(terminal) = terminal {
         // A new session whose controlling terminal is the pty. That also
         // makes a new process group.
-        terminal.configure(&mut cmd)?;
+        terminal.configure(&mut prog)?;
     } else {
         // Its own process group, so signals can reach the whole pipeline.
-        cmd.process_group(0)
+        prog.process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
     }
 
-    let child = cmd.spawn()?;
+    let child = prog.spawn()?;
     debug!(pid = child.id(), command = ?command.map(String::from_utf8_lossy), "spawned");
     Ok(child)
 }
