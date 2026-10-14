@@ -259,21 +259,16 @@ fn spawn(
     let shell = &settings.shell;
     let mut cmd = Command::new(shell);
 
-    // Set the program to execute. Clippy (pedantic) would rather see
-    // `if let ... else` here; the `match` reads better with two arms
-    // of similar weight.
-    #[expect(clippy::single_match_else)]
-    match command {
+    // Set the program to execute. 
+    if let Some(command) = command {
         // Unix command lines are bytes, not necessarily UTF-8.
-        Some(command) => cmd.arg("-c").arg(OsStr::from_bytes(command)),
-
+        cmd.arg("-c").arg(OsStr::from_bytes(command));
+    } else {
         // A leading '-' in argv[0] tells the shell it's a log-in shell.
-        None => {
-            let mut arg0 = OsString::from("-");
-            arg0.push(shell.file_name().unwrap_or(shell.as_os_str()));
-            cmd.arg0(arg0)
-        }
-    };
+        let mut arg0 = OsString::from("-");
+        arg0.push(shell.file_name().unwrap_or(shell.as_os_str()));
+        cmd.arg0(arg0);
+    }
 
     // Default environment variables; possibly overridden below.
     cmd.env_clear()
@@ -295,6 +290,7 @@ fn spawn(
         }
     }
 
+    // Terminal-specific environment variables
     if let Some(terminal) = terminal {
         if !terminal.term().is_empty() {
             cmd.env("TERM", terminal.term());
@@ -306,17 +302,18 @@ fn spawn(
     cmd.envs(settings.env.iter().map(|(name, value)| (name, value)));
 
     cmd.current_dir(&settings.home);
-    match terminal {
+
+    // Configure I/O to child process.
+    if let Some(terminal) = terminal {
         // A new session whose controlling terminal is the pty. That also
         // makes a new process group.
-        Some(terminal) => terminal.configure(&mut cmd)?,
+        terminal.configure(&mut cmd)?;
+    } else {
         // Its own process group, so signals can reach the whole pipeline.
-        None => {
-            cmd.process_group(0)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-        }
+        cmd.process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
     }
 
     let child = cmd.spawn()?;
