@@ -59,3 +59,14 @@ pub enum CodecError {
     #[error("stream ended in the middle of a message ({buffered} bytes buffered)")]
     Truncated { buffered: usize },
 }
+
+/// Lets code that deals in `io::Error` use `?` on codec results. I/O errors
+/// come back out unchanged; protocol errors become `InvalidData`.
+impl From<CodecError> for std::io::Error {
+    fn from(e: CodecError) -> Self {
+        match e {
+            CodecError::Io(e) => e,
+            other => Self::new(std::io::ErrorKind::InvalidData, other),
+        }
+    }
+}

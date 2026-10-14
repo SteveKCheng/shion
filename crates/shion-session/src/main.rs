@@ -3,6 +3,7 @@
 mod carrier;
 mod channel;
 mod control;
+mod pty;
 mod server;
 mod settings;
 mod signals;

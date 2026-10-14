@@ -1,0 +1,284 @@
+//! Non-blocking file descriptors driven by tokio's reactor (epoll).
+//!
+//! Tokio's own `stdin()`/`stdout()` do blocking I/O on a helper thread that
+//! can't be cancelled, so shutting the runtime down can hang until more
+//! input arrives. Instead, fds that support readiness polling (pipes,
+//! sockets, FIFOs, ttys, pty masters: everything except regular files) are
+//! registered with the reactor through [`AsyncFd`]. Regular files never
+//! block indefinitely, so [`reader`] and [`writer`] fall back to
+//! `tokio::fs::File` for them, which uses the blocking thread pool.
+
+use std::fs::File;
+use std::io;
+use std::os::fd::OwnedFd;
+use std::pin::Pin;
+use std::task::{Context, Poll, ready};
+
+use rustix::fs::OFlags;
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+pub type BoxedRead = Box<dyn AsyncRead + Send + Unpin>;
+pub type BoxedWrite = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// Wraps any readable fd. Must be called from inside a tokio runtime.
+///
+/// We need run-time polymorphism (a `Box<dyn …>`) because the concrete type
+/// depends on what the fd turns out to be:
+///
+///   - [`FdStream`] for fds that support non-blocking operation and polling.
+///   - `tokio::fs::File` for regular files.
+///
+/// # Errors
+/// If the fd's flags can't be read or changed, or registration fails for a
+/// reason other than the fd being a regular file.
+pub fn reader(fd: OwnedFd) -> io::Result<BoxedRead> {
+    Ok(match FdStream::new(fd)? {
+        Ok(stream) => Box::new(stream),
+        Err(fd) => Box::new(tokio::fs::File::from_std(File::from(fd))),
+    })
+}
+
+/// Wraps any writable fd. See [`reader`].
+///
+/// # Errors
+/// As for [`reader`].
+pub fn writer(fd: OwnedFd) -> io::Result<BoxedWrite> {
+    Ok(match FdStream::new(fd)? {
+        Ok(stream) => Box::new(stream),
+        Err(fd) => Box::new(tokio::fs::File::from_std(File::from(fd))),
+    })
+}
+
+/// Wraps an input fd and an output fd, which may be the same file.
+///
+/// Prefer this to separate [`reader`] and [`writer`] calls for stdin and
+/// stdout. When both are one file (a terminal, or one end of a
+/// `socketpair` passed as both), they usually share one *open file
+/// description*, and with it the `O_NONBLOCK` flag. Two [`FdStream`]s on it
+/// would each remember the flags they found, and whichever was created
+/// second would "restore" `O_NONBLOCK` when dropped, leaving, say, your
+/// shell's terminal non-blocking. So in that case we wrap only `input`,
+/// which must be open for both reading and writing, and split it.
+///
+/// # Errors
+/// As for [`reader`].
+pub fn duplex(mut input: OwnedFd, output: OwnedFd) -> io::Result<(BoxedRead, BoxedWrite)> {
+    if same_file(&input, &output)? && is_read_write(&input)? {
+        match FdStream::new(input)? {
+            Ok(stream) => {
+                drop(output); // a duplicate we don't need
+                let (r, w) = tokio::io::split(stream);
+                return Ok((Box::new(r), Box::new(w)));
+            }
+            Err(fd) => input = fd, // a regular file: no flags to worry about
+        }
+    }
+    Ok((reader(input)?, writer(output)?))
+}
+
+fn same_file(a: &OwnedFd, b: &OwnedFd) -> io::Result<bool> {
+    let (a, b) = (rustix::fs::fstat(a)?, rustix::fs::fstat(b)?);
+    Ok((a.st_dev, a.st_ino) == (b.st_dev, b.st_ino))
+}
+
+fn is_read_write(fd: &OwnedFd) -> io::Result<bool> {
+    Ok(rustix::fs::fcntl_getfl(fd)? & OFlags::RWMODE == OFlags::RDWR)
+}
+
+/// A non-blocking fd driven by tokio's reactor.
+///
+/// Implements both `AsyncRead` and `AsyncWrite`; whether both work depends
+/// on the fd. To read and write from different tasks, use
+/// `tokio::io::split`.
+#[derive(Debug)]
+pub struct FdStream {
+    fd: AsyncFd<OwnedFd>,
+    /// File status flags before we set `O_NONBLOCK`, restored on drop.
+    /// `O_NONBLOCK` belongs to the *open file description*, which is shared
+    /// with whoever gave us the fd (say, an interactive shell's tty), so we
+    /// put it back the way we found it.
+    original_flags: OFlags,
+}
+
+impl FdStream {
+    /// Wraps `fd`, or gives it back (`Ok(Err(fd))`) if epoll doesn't
+    /// support it, as with regular files. Must be called from inside a
+    /// tokio runtime.
+    ///
+    /// The nested `Result` separates "real error" (outer) from "this fd
+    /// needs a different strategy" (inner).
+    ///
+    /// # Errors
+    /// If the fd's flags can't be read or changed, or registration fails for
+    /// a reason other than the fd being a regular file.
+    pub fn new(fd: OwnedFd) -> io::Result<Result<Self, OwnedFd>> {
+        let original_flags = rustix::fs::fcntl_getfl(&fd)?;
+        rustix::fs::fcntl_setfl(&fd, original_flags | OFlags::NONBLOCK)?;
+        // `unsafe` because the reactor keeps using the raw fd number, which
+        // would go wrong if the wrapped object closed or swapped its fd
+        // behind tokio's back. (Tokio 1.53 deprecated the safe `try_new`
+        // for exactly that reason.) The workspace denies `unsafe_code`, so
+        // this one block has to opt out explicitly, and clippy requires the
+        // SAFETY comment.
+        #[allow(unsafe_code)]
+        // SAFETY: `OwnedFd` owns a valid, open fd, never closes or replaces
+        // it except on drop, and `as_raw_fd` always returns the same number.
+        let registered = unsafe { AsyncFd::register(fd) };
+        match registered {
+            Ok(fd) => Ok(Ok(Self { fd, original_flags })),
+            // On failure we get the fd back, still owned, and can fall back
+            // to something else.
+            Err(e) => {
+                let (fd, err) = e.into_parts();
+                rustix::fs::fcntl_setfl(&fd, original_flags)?;
+                if err.kind() == io::ErrorKind::PermissionDenied {
+                    Ok(Err(fd)) // epoll refuses regular files with EPERM
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+}
+
+impl Drop for FdStream {
+    fn drop(&mut self) {
+        // Best effort: nothing useful to do if this fails during teardown.
+        let _ = rustix::fs::fcntl_setfl(self.fd.get_ref(), self.original_flags);
+    }
+}
+
+// The standard readiness pattern: wait until epoll says the fd is ready,
+// try the syscall, and if it says EAGAIN after all, `try_io` clears the
+// readiness flag and we go round again.
+
+impl AsyncRead for FdStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            let mut guard = ready!(self.fd.poll_read_ready(cx))?;
+            let unfilled = buf.initialize_unfilled();
+            match guard.try_io(|fd| Ok(rustix::io::read(fd.get_ref(), &mut *unfilled)?)) {
+                Ok(Ok(n)) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(Err(e)) => return Poll::Ready(Err(e)),
+                Err(_would_block) => {}
+            }
+        }
+    }
+}
+
+impl AsyncWrite for FdStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            let mut guard = ready!(self.fd.poll_write_ready(cx))?;
+            match guard.try_io(|fd| Ok(rustix::io::write(fd.get_ref(), data)?)) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => {}
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Nothing is buffered in user space.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // The fd is closed when the FdStream is dropped. (For a socket we
+        // could `shutdown(SHUT_WR)` here, but we don't assume a socket.)
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn pipe_roundtrip_and_flags_restored() {
+        let (r, w) = rustix::pipe::pipe().unwrap();
+        let r2 = r.try_clone().unwrap(); // shares the open file description
+        let mut reader = reader(r).unwrap();
+        let mut writer = writer(w).unwrap();
+        assert!(
+            rustix::fs::fcntl_getfl(&r2)
+                .unwrap()
+                .contains(OFlags::NONBLOCK)
+        );
+
+        writer.write_all(b"hello").await.unwrap();
+        drop(writer);
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"hello");
+
+        drop(reader);
+        assert!(
+            !rustix::fs::fcntl_getfl(&r2)
+                .unwrap()
+                .contains(OFlags::NONBLOCK)
+        );
+    }
+
+    #[tokio::test]
+    async fn duplex_shares_one_fd_and_restores_flags() {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let theirs = OwnedFd::from(theirs);
+        let watch = theirs.try_clone().unwrap();
+        let (mut r, mut w) = duplex(theirs.try_clone().unwrap(), theirs).unwrap();
+        assert!(
+            rustix::fs::fcntl_getfl(&watch)
+                .unwrap()
+                .contains(OFlags::NONBLOCK)
+        );
+
+        w.write_all(b"ping").await.unwrap();
+        let mut ours = tokio::net::UnixStream::from_std({
+            ours.set_nonblocking(true).unwrap();
+            ours
+        })
+        .unwrap();
+        let mut got = [0; 4];
+        ours.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ping");
+        ours.write_all(b"pong").await.unwrap();
+        r.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"pong");
+
+        // Dropped in creation order: the case that went wrong with two
+        // separate `FdStream`s.
+        drop(r);
+        drop(w);
+        assert!(
+            !rustix::fs::fcntl_getfl(&watch)
+                .unwrap()
+                .contains(OFlags::NONBLOCK)
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_files_fall_back() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"data").unwrap();
+        let fd = OwnedFd::from(file.reopen().unwrap());
+        assert!(FdStream::new(fd.try_clone().unwrap()).unwrap().is_err());
+        let mut got = Vec::new();
+        reader(fd).unwrap().read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"data");
+    }
+}

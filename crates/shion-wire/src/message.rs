@@ -80,8 +80,8 @@ pub struct PtyRequest {
     pub term: String,
     pub size: WindowSize,
     /// Terminal modes, still in SSH2's encoding even inside SSH3 (RFC 4254
-    /// §8: opcode byte + `uint32` argument, terminated by opcode 0). Decoded
-    /// by the session process, which applies them with `termios`.
+    /// §8: opcode byte + `uint32` argument, terminated by opcode 0). See
+    /// [`crate::modes`] for the codec.
     pub modes: Bytes,
 }
 

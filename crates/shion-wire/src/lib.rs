@@ -2,6 +2,8 @@
 //!
 //! - [`header`] and [`message`]: SSH3 channel streams, byte-compatible
 //!   with draft-michel-remote-terminal-http3 as implemented by sshoq.
+//! - [`modes`]: the terminal modes blob inside `pty-req`, which keeps its
+//!   SSH2 encoding.
 //! - [`control`]: shion's own per-conversation control stream.
 //! - [`codec`]: `tokio_util` codecs that frame all of the above on a byte
 //!   stream (an smux stream, in practice).
@@ -14,6 +16,7 @@ pub mod control;
 pub mod error;
 pub mod header;
 pub mod message;
+pub mod modes;
 pub mod stream;
 pub mod wire;
 

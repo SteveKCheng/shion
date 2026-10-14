@@ -333,9 +333,9 @@ Ordering rules from RFC 4254 that we have to keep:
 
 - All stdout/stderr data goes out **before** `exit-status`.
 - With a pty, the child exiting doesn't mean the output is finished.
-  Grandchildren may hold the slave open. Like OpenSSH, we read the master
-  until `EIO` *or* until the child has exited and the master has been idle
-  briefly. We don't wait forever on a backgrounded daemon.
+  Grandchildren may hold the slave open. We read the master until `EIO`
+  *or* until the child has exited and the master has then been idle for
+  100 ms (`TERMINAL_LINGER`). We don't wait forever on a backgrounded daemon.
 - Peer FIN on a pipe session closes the child's stdin. On a pty session
   there's no stdin to close, so OpenSSH just stops reading. We do the same.
 
@@ -349,8 +349,11 @@ Ordering rules from RFC 4254 that we have to keep:
   `USER`/`LOGNAME` (the app-level name), `SHELL`, `PATH`, `TERM` (if pty),
   `SSH_CONNECTION`-style info, then accepted `env` requests filtered by the
   `--accept-env` globs. cwd = home.
-- Every child runs `setsid()` in `pre_exec`, so it gets its own process group.
-  `signal` requests and conversation teardown target the group.
+- Every child gets its own process group: `process_group(0)` for pipes,
+  `setsid()` for a pty (§5.4). `signal` requests and conversation teardown
+  target the group; with a pty, `signal` targets the terminal's *foreground*
+  group, the one `^C` would hit, since a job-control shell runs each job in
+  a group of its own.
 
 Without a pty we use `tokio::process::Command` with three pipes. That's
 straightforward.
@@ -361,21 +364,27 @@ I'd write this ourselves on top of `rustix` (the `pty` and `termios` modules)
 rather than pull in `portable-pty`, which is blocking and thread-based. It's
 about 200 lines and the most Unix-heavy part of the project:
 
-1. `openpt(O_RDWR|O_NOCTTY|O_CLOEXEC)`, `grantpt`, `unlockpt`, `ptsname`.
+1. `openpt(O_RDWR|O_NOCTTY|O_CLOEXEC)`, `grantpt`, `unlockpt`, `ptsname`
+   (only for `SSH_TTY`); the slave is opened with `TIOCGPTPEER` rather than
+   by path. Done at `pty-req` time, so allocation failure answers that
+   request, as in OpenSSH.
 2. Apply `pty-req`: `TIOCSWINSZ` with cols/rows/px, then decode the RFC 4254
    §8 *encoded terminal modes* (opcode byte + `uint32`, terminated by 0. Note
-   that inside SSH3 this blob is still SSH2-encoded) into `termios`.
-3. Spawn with `Command::pre_exec`: `setsid()`, open the slave (which makes it
-   the controlling terminal, or use `TIOCSCTTY` explicitly), and dup it to
-   0/1/2. `pre_exec` is `unsafe` because it runs between fork and exec, so
+   that inside SSH3 this blob is still SSH2-encoded) into `termios`. The
+   codec is `shion_wire::modes`; the front-end will need its encoder, since
+   russh hands over the modes already decoded.
+3. Spawn with the slave as stdin/stdout/stderr, and `Command::pre_exec`
+   running `setsid()` and `TIOCSCTTY`. Then close our copy of the slave, or
+   the master never reports `EIO`. `pre_exec` is `unsafe` because it runs between fork and exec, so
    only async-signal-safe calls are allowed there. This is a good place to see
    how Rust's `unsafe` contract maps to the C rules you already know.
-4. Master set `O_NONBLOCK` and wrapped in `tokio::io::unix::AsyncFd`, which
-   gives `AsyncRead`/`AsyncWrite` without a thread per pty.
+4. Master set `O_NONBLOCK` and wrapped in `tokio::io::unix::AsyncFd` (the
+   `shion-fd` crate, shared with the carrier), which gives
+   `AsyncRead`/`AsyncWrite` without a thread per pty.
 5. `window-change` → `TIOCSWINSZ` on the master (the kernel sends `SIGWINCH`).
 
-Linux-only for now, behind a `pty` module with a small trait so a ConPTY
-backend could slot in later.
+Linux-only for now, in a `pty` module whose `Terminal` type is the seam
+where a ConPTY backend could slot in later.
 
 ### 5.5 Port forwarding (M4)
 
@@ -432,11 +441,16 @@ shion/
 │   ├── shion-wire/            pure codec, no I/O: varint, string, channel
 │   │                          header, messages, channel requests, control
 │   │                          messages; tokio_util::codec Decoder/Encoder
-│   ├── shion-session/         the session process (bin + lib for tests)
-│   ├── shion-attach/          debug client: spawns shion-session (optionally
-│   │                          under bwrap) and gives you an interactive pty
-│   │                          or runs one exec, so you can test M1–M3
-│   │                          before any SSH front-end exists
+│   ├── shion-mux/             async-smux stream wrapper (works around a
+│   │                          flush-after-shutdown bug in 0.4.0)
+│   ├── shion-fd/              non-blocking fds on tokio's reactor, for the
+│   │                          carrier, pty masters and the like
+│   ├── shion-session/         the session process (binary)
+│   ├── shion-attach/          debug client: spawns shion-session (or any
+│   │                          command line, e.g. under bwrap, with `-S`)
+│   │                          and attaches like `ssh`: an interactive pty or
+│   │                          one command, so you can test M1–M3 before any
+│   │                          SSH front-end exists
 │   └── shion-front/           russh front-end (later)
 ├── docs/
 └── notes/
@@ -457,7 +471,7 @@ Main dependencies: `tokio`, `tokio-util`, `bytes`, `async-smux`, `rustix`,
 |----|------------------------------------------------------------------------------|--------------------------------------------------|
 | M0 | Workspace and `shion-wire` codec (done)                                      | unit tests, sshoq vectors                        |
 | M1 | session: carrier, control stream, `exec` over pipes, `exit-status` (done)    | integration test spawns binary, drives smux      |
-| M2 | pty, `shell`, `window-change`, `signal`, terminal modes; `shion-attach`      | interactive `bash`, `vim`, resize, `^C`          |
+| M2 | pty, `shell`, `window-change`, `signal`, terminal modes; `shion-attach` (done) | interactive `bash`, `vim`, resize, `^C`          |
 | M3 | subsystems (sftp), env allowlist, conversation teardown, `PR_SET_DUMPABLE`   | `sftp` via shion-attach; fd-leak test            |
 | M4 | `direct-tcpip`, `tcpip-forward` / `forwarded-tcpip`                          | curl through a forward                           |
 | M5 | `shion-front`: russh, user DB, bwrap policy, SSH2⇄SSH3 translation           | real `ssh`, `sftp`, `ssh -L/-R` against it       |

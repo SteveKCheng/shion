@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use async_smux::MuxBuilder;
+use async_smux::error::MuxError;
 use futures_util::StreamExt;
 use shion_wire::codec::{ControlCodec, MessageCodec, StreamStartCodec};
 use shion_wire::{CodecError, StreamStart};
@@ -41,7 +42,9 @@ pub async fn serve(carrier: Carrier, state: Arc<ServerState>) {
 
     info!("carrier closed");
     match worker.await {
-        Ok(Ok(())) => {}
+        // async-smux reports the front-end closing the carrier as
+        // `ConnectionClosed`: for us, that's the normal way to end.
+        Ok(Ok(()) | Err(MuxError::ConnectionClosed)) => {}
         Ok(Err(e)) => warn!(error = %e, "smux connection failed"),
         Err(e) => warn!(error = %e, "smux worker panicked"),
     }

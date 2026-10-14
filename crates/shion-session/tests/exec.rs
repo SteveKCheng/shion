@@ -10,7 +10,7 @@ use common::{
 };
 use futures_util::{SinkExt, StreamExt};
 use shion_wire::header::channel_type;
-use shion_wire::message::{PtyRequest, WindowSize, open_failure};
+use shion_wire::message::{WindowSize, X11Request, open_failure};
 use shion_wire::{ChannelHeader, ChannelRequest, ControlMessage, Message};
 
 #[tokio::test]
@@ -239,12 +239,16 @@ async fn unsupported_requests_are_refused_without_closing_the_channel() {
         let _control = harness.conversation(1).await;
         let mut channel = harness.session(1).await;
 
-        let pty = ChannelRequest::PtyReq(PtyRequest {
-            term: "xterm".into(),
-            size: WindowSize::default(),
-            modes: Bytes::new(),
+        let x11 = ChannelRequest::X11Req(X11Request {
+            single_connection: false,
+            auth_protocol: "MIT-MAGIC-COOKIE-1".into(),
+            auth_cookie: "00".into(),
+            screen: 0,
         });
-        assert_eq!(request(&mut channel, pty).await, Message::Failure);
+        assert_eq!(request(&mut channel, x11).await, Message::Failure);
+        // Only meaningful with a pty.
+        let resize = ChannelRequest::WindowChange(WindowSize::default());
+        assert_eq!(request(&mut channel, resize).await, Message::Failure);
         let sftp = ChannelRequest::Subsystem {
             name: "sftp".into(),
         };

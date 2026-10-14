@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use shion_wire::codec::{ControlCodec, MessageCodec, StreamStartCodec};
 use shion_wire::control::{PROTOCOL_VERSION, attr};
 use shion_wire::header::channel_type;
-use shion_wire::message::EXTENDED_DATA_STDERR;
+use shion_wire::message::{EXTENDED_DATA_STDERR, PtyRequest, WindowSize};
 use shion_wire::{ChannelHeader, ChannelRequest, ControlMessage, ConvOpen, Message, StreamStart};
 use tempfile::TempDir;
 use tokio::io::{AsyncRead, AsyncWrite, Join};
@@ -224,6 +224,46 @@ pub async fn exec(channel: &mut Channel, command: &str) {
     )
     .await;
     assert_eq!(reply, Message::Success, "exec {command:?}");
+}
+
+/// Sends `pty-req` for a `cols`×`rows` terminal and asserts that it was
+/// accepted.
+pub async fn pty_req(channel: &mut Channel, cols: u64, rows: u64, modes: Bytes) {
+    let reply = request(
+        channel,
+        ChannelRequest::PtyReq(PtyRequest {
+            term: "xterm-256color".into(),
+            size: WindowSize {
+                cols,
+                rows,
+                width_px: 0,
+                height_px: 0,
+            },
+            modes,
+        }),
+    )
+    .await;
+    assert_eq!(reply, Message::Success, "pty-req");
+}
+
+/// Sends data to the child.
+pub async fn send(channel: &mut Channel, data: &str) {
+    channel
+        .send(Message::Data(Bytes::copy_from_slice(data.as_bytes())))
+        .await
+        .unwrap();
+}
+
+/// Reads output until it contains `needle`, and returns all of it.
+pub async fn read_until(channel: &mut Channel, needle: &str) -> String {
+    let mut seen = String::new();
+    while !seen.contains(needle) {
+        match channel.next().await.expect("channel closed").unwrap() {
+            Message::Data(data) => seen.push_str(std::str::from_utf8(&data).unwrap()),
+            other => panic!("unexpected message {other:?} after {seen:?}"),
+        }
+    }
+    seen
 }
 
 /// Everything a channel sent after the session started.

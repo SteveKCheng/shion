@@ -12,6 +12,10 @@
 //!  smux stream ──► this task ──mpsc──► stdin pump ──► child stdin
 //! ```
 //!
+//! With a terminal, the child's stdin, stdout and stderr are all the pty
+//! slave, so one "terminal pump" reading the master replaces the stdout
+//! and stderr pumps, and the stdin pump writes to the master.
+//!
 //! Output ordering falls out of ownership: the writer sends FIN once every
 //! `Sender` is gone. The pumps drop theirs at EOF, and this task drops its
 //! last one right after queuing `exit-status`, so `exit-status` always
@@ -23,6 +27,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
@@ -33,12 +38,13 @@ use shion_wire::control::attr;
 use shion_wire::header::channel_type;
 use shion_wire::message::{EXTENDED_DATA_STDERR, ExitSignal, open_failure};
 use shion_wire::{ChannelHeader, ChannelRequest, CodecError, ConvOpen, Message};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::process::{Child, Command};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
+use crate::pty::Terminal;
 use crate::server::Stream;
 use crate::settings::Settings;
 use crate::signals;
@@ -50,6 +56,12 @@ const OUR_MAX_PACKET: u64 = 32 * 1024;
 
 /// `PATH` for children unless `--setenv PATH=…` says otherwise.
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+/// Once a child with a terminal has exited, how long the terminal may stay
+/// silent before we stop reading it. Its output usually ends with `EIO`
+/// right away, but a background job holding the slave open would otherwise
+/// keep the channel open forever.
+const TERMINAL_LINGER: Duration = Duration::from_millis(100);
 
 type Incoming = SplitStream<Framed<Stream, MessageCodec>>;
 type Outgoing = SplitSink<Framed<Stream, MessageCodec>, Message>;
@@ -89,8 +101,10 @@ pub async fn run(
     let (out, out_rx) = mpsc::channel(32);
     let writer = tokio::spawn(write_messages(sink, out_rx));
 
-    if let Some(child) = setup(&mut incoming, &out, &state.settings, &conversation).await? {
-        let status = supervise(child, &mut incoming, &out, packet_size).await?;
+    if let Some((child, terminal)) =
+        setup(&mut incoming, &out, &state.settings, &conversation).await?
+    {
+        let status = supervise(child, terminal, &mut incoming, &out, packet_size).await?;
         info!(conversation = header.conversation_id, %status, "session ended");
         let _ = out.send(exit_message(status)).await;
     }
@@ -153,7 +167,11 @@ async fn setup(
     out: &Out,
     settings: &Settings,
     conversation: &ConvOpen,
-) -> Result<Option<Child>, CodecError> {
+) -> Result<Option<(Child, Option<Terminal>)>, CodecError> {
+    // Allocated by `pty-req`, as OpenSSH does, so that failure is reported
+    // in reply to that request rather than to `shell`.
+    let mut terminal = None;
+
     while let Some(msg) = incoming.next().await {
         match msg? {
             Message::Request {
@@ -163,19 +181,49 @@ async fn setup(
                 let command = match request {
                     ChannelRequest::Shell => None,
                     ChannelRequest::Exec { command } => Some(command),
-                    // pty-req (M2), env and subsystem (M3), x11-req (never).
+                    ChannelRequest::PtyReq(request) => {
+                        // One terminal per channel.
+                        let ok = terminal.is_none()
+                            && match Terminal::open(&request) {
+                                Ok(t) => {
+                                    terminal = Some(t);
+                                    true
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "cannot allocate a pty");
+                                    false
+                                }
+                            };
+                        reply(out, want_reply, ok).await;
+                        continue;
+                    }
+                    ChannelRequest::WindowChange(size) => {
+                        // Also allowed before the session starts.
+                        let ok = terminal.as_ref().is_some_and(|t| t.resize(size).is_ok());
+                        reply(out, want_reply, ok).await;
+                        continue;
+                    }
+                    // env and subsystem (M3), x11-req (never).
                     other => {
                         debug!(request = other.type_name(), "refusing request");
                         reply(out, want_reply, false).await;
                         continue;
                     }
                 };
-                match spawn(settings, conversation, command.as_deref()) {
+                match spawn(
+                    settings,
+                    conversation,
+                    command.as_deref(),
+                    terminal.as_ref(),
+                ) {
                     Ok(child) => {
+                        if let Some(t) = &mut terminal {
+                            t.close_slave();
+                        }
                         // Queued before any output can be: the pumps that
                         // produce output don't exist yet.
                         reply(out, want_reply, true).await;
-                        return Ok(Some(child));
+                        return Ok(Some((child, terminal)));
                     }
                     Err(e) => {
                         warn!(error = %e, shell = %settings.shell.display(), "cannot start session");
@@ -200,11 +248,13 @@ async fn setup(
 /// Note: There is no SSH request to launch a program executable directly
 /// with an argument vector.
 ///
-/// `stdin`, `stdout`, and `stderr` for the child process are pipes.
+/// `stdin`, `stdout`, and `stderr` for the child process are pipes, or the
+/// `terminal`'s slave if there is one.
 fn spawn(
     settings: &Settings,
     conversation: &ConvOpen,
     command: Option<&[u8]>,
+    terminal: Option<&Terminal>,
 ) -> io::Result<Child> {
     let shell = &settings.shell;
     let mut cmd = Command::new(shell);
@@ -245,15 +295,29 @@ fn spawn(
         }
     }
 
+    if let Some(terminal) = terminal {
+        if !terminal.term().is_empty() {
+            cmd.env("TERM", terminal.term());
+        }
+        cmd.env("SSH_TTY", terminal.path());
+    }
+
     // Apply user-supplied overrides/additions to environment variables
     cmd.envs(settings.env.iter().map(|(name, value)| (name, value)));
 
-    cmd.current_dir(&settings.home)
+    cmd.current_dir(&settings.home);
+    match terminal {
+        // A new session whose controlling terminal is the pty. That also
+        // makes a new process group.
+        Some(terminal) => terminal.configure(&mut cmd)?,
         // Its own process group, so signals can reach the whole pipeline.
-        .process_group(0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        None => {
+            cmd.process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
+    }
 
     let child = cmd.spawn()?;
     debug!(pid = child.id(), command = ?command.map(String::from_utf8_lossy), "spawned");
@@ -263,48 +327,69 @@ fn spawn(
 /// Runs the child to completion while relaying data and requests.
 async fn supervise(
     mut child: Child,
+    terminal: Option<Terminal>,
     incoming: &mut Incoming,
     out: &Out,
     packet_size: usize,
 ) -> Result<ExitStatus, CodecError> {
-    // With `process_group(0)` the group ID equals the child's PID.
+    // With `process_group(0)` or `setsid` the group ID equals the child's
+    // PID.
     let pgid = child
         .id()
         .and_then(|id| i32::try_from(id).ok())
         .and_then(Pid::from_raw);
 
-    // All three were configured as pipes in `spawn`, so `take` can't fail.
-    let stdin = child.stdin.take().expect("stdin is piped");
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-
-    // Begin pump for the child process's stdin
     let (input, input_rx) = mpsc::channel(16);
     let mut input = Some(input); // for dropping `input` early
-    tokio::spawn(pump_input(input_rx, stdin));
 
-    // Begin pumps for the child process's stdout and stderr.
-    // Data for stderr is distinguished from stdout, in the SSH protocol,
-    // by setting 'EXTENDED_DATA_ERROR` as the data type.
-    let stdout_pump = tokio::spawn(pump_output(stdout, out.clone(), None, packet_size));
-    let stderr_pump = tokio::spawn(pump_output(
-        stderr,
-        out.clone(),
-        Some(EXTENDED_DATA_STDERR),
-        packet_size,
-    ));
+    // Tells the terminal pump that the child has exited.
+    let (exited, child_exited) = oneshot::channel();
 
-    // Future that completes when the child exits (normally or terminated by a signal).
+    let output = match &terminal {
+        None => {
+            // All three were configured as pipes in `spawn`, so `take`
+            // can't fail.
+            let stdin = child.stdin.take().expect("stdin is piped");
+            let stdout = child.stdout.take().expect("stdout is piped");
+            let stderr = child.stderr.take().expect("stderr is piped");
+            tokio::spawn(pump_input(input_rx, stdin));
+
+            // Data for stderr is distinguished from stdout, in the SSH
+            // protocol, by sending it as extended data of type
+            // `EXTENDED_DATA_STDERR`.
+            let out = out.clone();
+            tokio::spawn(async move {
+                tokio::join!(
+                    pump_output(stdout, out.clone(), None, packet_size),
+                    pump_output(stderr, out, Some(EXTENDED_DATA_STDERR), packet_size),
+                );
+            })
+        }
+        Some(terminal) => {
+            // One fd for both directions. `split` lets two tasks share it.
+            let (reader, writer) = tokio::io::split(terminal.stream()?);
+            tokio::spawn(pump_input(input_rx, writer));
+            tokio::spawn(pump_terminal(
+                reader,
+                out.clone(),
+                packet_size,
+                child_exited,
+            ))
+        }
+    };
+
+    // Future that completes when the child exits (normally or terminated
+    // by a signal) and its output has been relayed.
     //
-    // Furthermore, wait for any remaining data in output pipes, which might have be
-    // written to by a descendant process that inherited those pipes, to drain.
-    //
-    // OpenSSH waits for the output pipes too, which can be observed by running
-    // `ssh host 'sleep 60 &'`: it will hang for a full minute.
+    // With pipes, that means waiting for EOF, even if a descendant process
+    // that inherited the pipes keeps them open. OpenSSH does the same,
+    // which can be observed by running `ssh host 'sleep 60 &'`: it will
+    // hang for a full minute. With a terminal, see `pump_terminal`.
     let finished = async move {
         let status = child.wait().await;
-        let _ = stdout_pump.await;
-        let _ = stderr_pump.await;
+        // Fails only if the receiver is gone, i.e. there's no terminal.
+        let _ = exited.send(());
+        let _ = output.await;
         status
     };
 
@@ -335,9 +420,16 @@ async fn supervise(
                     }
                 }
                 Some(Ok(Message::Request { want_reply, request: ChannelRequest::Signal { name } })) => {
-                    let delivered = signals::from_name(&name).is_some_and(|sig| signals::kill_group(pgid, sig));
+                    // With a terminal, signal what `^C` would; the shell
+                    // itself may be in a different process group.
+                    let target = terminal.as_ref().and_then(Terminal::foreground_group).or(pgid);
+                    let delivered = signals::from_name(&name).is_some_and(|sig| signals::kill_group(target, sig));
                     debug!(signal = name, delivered, "signal request");
                     reply(out, want_reply, delivered).await;
+                }
+                Some(Ok(Message::Request { want_reply, request: ChannelRequest::WindowChange(size) })) => {
+                    let ok = terminal.as_ref().is_some_and(|t| t.resize(size).is_ok());
+                    reply(out, want_reply, ok).await;
                 }
                 Some(Ok(Message::Request { want_reply, request })) => {
                     debug!(request = request.type_name(), "refusing request on running session");
@@ -349,20 +441,23 @@ async fn supervise(
     }
 }
 
-/// Continuously copies data into the child process's stdin.
+/// Continuously copies data into the child process's stdin (a pipe or the
+/// pty master).
 ///
 /// `rx` is the queue where the SSH message parser pushes data to pump
 /// into the child process.
 ///
 /// Copying stops when `rx` is closed, or writing to the child fails.
-async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: ChildStdin) {
+async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: impl AsyncWrite + Unpin) {
     while let Some(data) = rx.recv().await {
         if let Err(e) = stdin.write_all(&data).await {
             debug!(error = %e, "child's stdin closed");
             return;
         }
     }
-    // `stdin` is dropped here, closing the pipe: the child reads EOF.
+    // `stdin` is dropped here. For a pipe, that closes it and the child
+    // reads EOF. A pty master stays open through the reading half, so the
+    // child simply gets no more input, as with OpenSSH.
 }
 
 /// Continually copies the child's stdout or stderr to put into the
@@ -394,15 +489,73 @@ async fn pump_output(
                 return;
             }
         };
-        let data = Bytes::copy_from_slice(&buf[..n]);
-        let msg = match data_type {
-            None => Message::Data(data),
-            Some(data_type) => Message::ExtendedData { data_type, data },
-        };
-        if out.send(msg).await.is_err() {
+        if !send_output(&out, data_type, &buf[..n]).await {
             return;
         }
     }
+}
+
+/// Like [`pump_output`], for a terminal: copies the child's output from the
+/// pty master.
+///
+/// The master reports end-of-file as `EIO` once every copy of the slave is
+/// closed, normally right after the child exits. But a background job may
+/// still hold the slave, so once `child_exited` fires we also stop if the
+/// terminal stays silent for [`TERMINAL_LINGER`].
+async fn pump_terminal(
+    mut master: impl AsyncRead + Unpin,
+    out: Out,
+    packet_size: usize,
+    mut child_exited: oneshot::Receiver<()>,
+) {
+    let mut buf = vec![0; packet_size];
+    let mut exited = false;
+    loop {
+        let read = master.read(&mut buf);
+        let result = if exited {
+            match tokio::time::timeout(TERMINAL_LINGER, read).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    debug!("terminal idle after the child exited");
+                    return;
+                }
+            }
+        } else {
+            // Whichever finishes first. The losing future is dropped, which
+            // cancels it: a pending `read` on a non-blocking fd consumes
+            // nothing, so no output is lost.
+            tokio::select! {
+                result = read => result,
+                _ = &mut child_exited => {
+                    exited = true;
+                    continue;
+                }
+            }
+        };
+        let n = match result {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(e) => {
+                // EIO is the normal end.
+                debug!(error = %e, "terminal closed");
+                return;
+            }
+        };
+        if !send_output(&out, None, &buf[..n]).await {
+            return;
+        }
+    }
+}
+
+/// Queues `data` as `CHANNEL_DATA`, or as `CHANNEL_EXTENDED_DATA` if
+/// `data_type` is given. Returns false if the writer is gone.
+async fn send_output(out: &Out, data_type: Option<u64>, data: &[u8]) -> bool {
+    let data = Bytes::copy_from_slice(data);
+    let msg = match data_type {
+        None => Message::Data(data),
+        Some(data_type) => Message::ExtendedData { data_type, data },
+    };
+    out.send(msg).await.is_ok()
 }
 
 /// Create the SSH request message to report that a child process has exited.

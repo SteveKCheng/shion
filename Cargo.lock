@@ -456,6 +456,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "shion-attach"
+version = "0.1.0"
+dependencies = [
+ "async_smux",
+ "bytes",
+ "clap",
+ "futures-util",
+ "rustix",
+ "shion-mux",
+ "shion-wire",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "shion-fd"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "shion-mux"
 version = "0.1.0"
 dependencies = [
@@ -472,6 +497,7 @@ dependencies = [
  "clap",
  "futures-util",
  "rustix",
+ "shion-fd",
  "shion-mux",
  "shion-wire",
  "tempfile",
