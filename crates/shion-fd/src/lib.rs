@@ -86,18 +86,31 @@ fn is_read_write(fd: &OwnedFd) -> io::Result<bool> {
     Ok(rustix::fs::fcntl_getfl(fd)? & OFlags::RWMODE == OFlags::RDWR)
 }
 
-/// A non-blocking fd driven by tokio's reactor.
-///
+/// Adapts a file descriptor for async I/O in tokio's reactor.
+/// 
 /// Implements both `AsyncRead` and `AsyncWrite`; whether both work depends
-/// on the fd. To read and write from different tasks, use
+/// on the FD. To read and write from different tasks, use
 /// `tokio::io::split`.
+/// 
+/// The non-blocking flag `O_NONBLOCK` is set on the file descriptor,
+/// and then restored on dropping `FdStream`.
+/// 
+/// However, do note that `O_NONBLOCK` belongs to the *open file description*,
+/// which is shared between cloned FDs.  In shion, the target file descriptors 
+/// are either owned by the session process, or for the stdin/stdout of the
+/// session process, which can only be reasonably assumed to be solely used
+/// by the session process. (stdin and stdout are passing binary data so any
+/// process trying to read/write to them at the same time will surely corrupt
+/// the data.)  
+/// 
+/// In case the session process is run from the terminal, etc., restoring the 
+/// original file status is mostly about being nice: if the session process
+/// crashes, it is not guaranteed to restore the flags.
 #[derive(Debug)]
 pub struct FdStream {
     fd: AsyncFd<OwnedFd>,
-    /// File status flags before we set `O_NONBLOCK`, restored on drop.
-    /// `O_NONBLOCK` belongs to the *open file description*, which is shared
-    /// with whoever gave us the fd (say, an interactive shell's tty), so we
-    /// put it back the way we found it.
+
+    /// File status flags before `O_NONBLOCK` is set; restored on drop.
     original_flags: OFlags,
 }
 
