@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 use crate::server::Stream;
 use crate::settings::Settings;
 use crate::signals;
-use crate::state::State;
+use crate::state::ServerState;
 
 /// Largest data payload we accept per message, announced in our
 /// `CHANNEL_OPEN_CONFIRMATION`.
@@ -58,7 +58,7 @@ type Out = mpsc::Sender<Message>;
 pub async fn run(
     framed: Framed<Stream, MessageCodec>,
     header: ChannelHeader,
-    state: Arc<State>,
+    state: Arc<ServerState>,
 ) -> Result<(), CodecError> {
     // `split` gives independent read and write halves, so one task can
     // read while another writes.
@@ -106,7 +106,7 @@ pub async fn run(
 
 /// Decides whether to accept the channel. On refusal, returns the reason
 /// code and description for `CHANNEL_OPEN_FAILURE`.
-fn check_open(header: &ChannelHeader, state: &State) -> Result<Arc<ConvOpen>, (u64, String)> {
+fn check_open(header: &ChannelHeader, state: &ServerState) -> Result<Arc<ConvOpen>, (u64, String)> {
     if header.channel_type != channel_type::SESSION {
         return Err((
             open_failure::UNKNOWN_CHANNEL_TYPE,
@@ -193,28 +193,30 @@ async fn setup(
 }
 
 /// Executes a command with a fresh environment.
-/// 
+///
 /// `command` is the string to pass to the shell via its `-c` option.
 /// If `None`, then an (interactive) log-in shell is spawned.
 ///
 /// Note: There is no SSH request to launch a program executable directly
 /// with an argument vector.
-/// 
+///
 /// `stdin`, `stdout`, and `stderr` for the child process are pipes.
 fn spawn(
     settings: &Settings,
     conversation: &ConvOpen,
     command: Option<&[u8]>,
 ) -> io::Result<Child> {
-
     let shell = &settings.shell;
     let mut cmd = Command::new(shell);
 
-    // Set the program to execute.
+    // Set the program to execute. Clippy (pedantic) would rather see
+    // `if let ... else` here; the `match` reads better with two arms
+    // of similar weight.
+    #[expect(clippy::single_match_else)]
     match command {
         // Unix command lines are bytes, not necessarily UTF-8.
         Some(command) => cmd.arg("-c").arg(OsStr::from_bytes(command)),
-        
+
         // A leading '-' in argv[0] tells the shell it's a log-in shell.
         None => {
             let mut arg0 = OsString::from("-");
@@ -278,7 +280,7 @@ async fn supervise(
 
     // Begin pump for the child process's stdin
     let (input, input_rx) = mpsc::channel(16);
-    let mut input = Some(input);    // for dropping `input` early
+    let mut input = Some(input); // for dropping `input` early
     tokio::spawn(pump_input(input_rx, stdin));
 
     // Begin pumps for the child process's stdout and stderr.
@@ -294,10 +296,10 @@ async fn supervise(
 
     // Future that completes when the child exits (normally or terminated by a signal).
     //
-    // Furthermore, wait for any remaining data in output pipes, which might have be 
+    // Furthermore, wait for any remaining data in output pipes, which might have be
     // written to by a descendant process that inherited those pipes, to drain.
     //
-    // OpenSSH waits for the output pipes too, which can be observed by running 
+    // OpenSSH waits for the output pipes too, which can be observed by running
     // `ssh host 'sleep 60 &'`: it will hang for a full minute.
     let finished = async move {
         let status = child.wait().await;
@@ -348,10 +350,10 @@ async fn supervise(
 }
 
 /// Continuously copies data into the child process's stdin.
-/// 
+///
 /// `rx` is the queue where the SSH message parser pushes data to pump
 /// into the child process.
-/// 
+///
 /// Copying stops when `rx` is closed, or writing to the child fails.
 async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: ChildStdin) {
     while let Some(data) = rx.recv().await {
@@ -365,16 +367,16 @@ async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: ChildStdin) {
 
 /// Continually copies the child's stdout or stderr to put into the
 /// relevant SSH channel, in chunks of at most `packet_size`.
-/// 
-/// Copying stops when the child's stream reaches end-of-file, 
+///
+/// Copying stops when the child's stream reaches end-of-file,
 /// or the receiving channel for that output has been closed,
 /// or some other error is encountered.
-/// 
+///
 /// The payload bytes are wrapped in either a `SSH_MSG_CHANNEL_DATA` or
 /// `SSH_MSG_CHANNEL_EXTENDED_DATA` message.  If `data_type` is not None,
 /// that will be the data type code inside `SSH_MSG_CHANNEL_EXTENDED_DATA`.
-/// 
-/// `out` is the MPSC queue where this function will push the output 
+///
+/// `out` is the MPSC queue where this function will push the output
 /// SSH messages into.
 async fn pump_output(
     mut from: impl AsyncRead + Unpin,
@@ -404,9 +406,9 @@ async fn pump_output(
 }
 
 /// Create the SSH request message to report that a child process has exited.
-/// 
+///
 /// The request type in the message is:
-/// 
+///
 ///   - `exit-status` when the child process has exited normally.
 ///   - `exit-signal` when the child process has been terminated by a signal.
 fn exit_message(status: ExitStatus) -> Message {

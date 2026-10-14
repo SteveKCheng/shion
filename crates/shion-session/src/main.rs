@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::settings::Settings;
-use crate::state::State;
+use crate::state::ServerState;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -37,7 +37,7 @@ async fn main() -> ExitCode {
         warn!(error = %e, "cannot clear the dumpable flag");
     }
 
-    // Pair up stdin/stdout as a single bi-directional "carrier", 
+    // Pair up stdin/stdout as a single bi-directional "carrier",
     // i.e. it behaves like a socket stream that can be used for async-smux
     let carrier = match carrier::from_stdio() {
         Ok(carrier) => carrier,
@@ -52,7 +52,7 @@ async fn main() -> ExitCode {
         pid = std::process::id(),
         "session process started"
     );
-    
-    server::serve(carrier, State::new(settings)).await;
+
+    server::serve(carrier, ServerState::new(settings)).await;
     ExitCode::SUCCESS
 }

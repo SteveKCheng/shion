@@ -11,7 +11,7 @@ use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
 use crate::carrier::Carrier;
-use crate::state::State;
+use crate::state::ServerState;
 use crate::{channel, control};
 
 /// One smux stream over our carrier.
@@ -21,7 +21,7 @@ pub type Stream = shion_mux::Stream<Carrier>;
 ///
 /// Each stream opened by the front-end inside `carrier` will be dispatched
 /// to the appropriate handler.
-pub async fn serve(carrier: Carrier, state: Arc<State>) {
+pub async fn serve(carrier: Carrier, state: Arc<ServerState>) {
     // The front-end is the smux "client" (odd stream IDs); we're the
     // "server" (even IDs, which we'll need for forwarded-tcpip in M4).
     let (_connector, mut acceptor, worker) = MuxBuilder::server().with_connection(carrier).build();
@@ -47,9 +47,9 @@ pub async fn serve(carrier: Carrier, state: Arc<State>) {
     }
 }
 
-/// Reads the first message of a stream to find out what kind it is, 
+/// Reads the first message of a stream to find out what kind it is,
 /// then dispatches to the appropriate handler for the stream.
-async fn handle_stream(stream: Stream, state: Arc<State>) -> Result<(), CodecError> {
+async fn handle_stream(stream: Stream, state: Arc<ServerState>) -> Result<(), CodecError> {
     let mut framed = Framed::new(stream, StreamStartCodec::default());
 
     // `transpose` turns Option<Result<T, E>> into Result<Option<T>, E>, so

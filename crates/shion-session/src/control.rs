@@ -12,20 +12,19 @@ use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
 use crate::server::Stream;
-use crate::state::State;
+use crate::state::ServerState;
 
 /// Runs a conversation from `CONV_OPEN` until the front-end closes the
 /// control stream.
-/// 
+///
 /// Each "conversation", i.e. a high-level SSH connection from the end user's point of view,
 /// is associated with exactly one control stream.  This function will register the new
 /// conversation, mapped by its ID.
 pub async fn run(
     mut framed: Framed<Stream, ControlCodec>,
     open: ConvOpen,
-    state: Arc<State>,
+    state: Arc<ServerState>,
 ) -> Result<(), CodecError> {
-
     // Register the newly opened conversation into this session process's global state.
     let id = open.conversation_id;
     let _registration = match state.register(open) {
@@ -69,12 +68,11 @@ pub async fn run(
 
 /// Creates the `ConvAccept` message that we send back to the front-end process.
 fn accept() -> ConvAccept {
-
-    // Report for the front-end process, all the request types that this session 
-    // process can parse (from the client), minus the two that only flow from this process 
-    // back to the client. 
+    // Report for the front-end process, all the request types that this session
+    // process can parse (from the client), minus the two that only flow from this process
+    // back to the client.
     //
-    // Requests that we parse but don't support (yet) get a polite CHANNEL_FAILURE instead 
+    // Requests that we parse but don't support (yet) get a polite CHANNEL_FAILURE instead
     // of killing the channel.
     let request_types = request_type::ALL
         .iter()

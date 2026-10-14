@@ -30,14 +30,14 @@ pub type BoxedWrite = Box<dyn AsyncWrite + Send + Unpin>;
 /// the shape async-smux wants.
 ///
 /// We require run-time polymorphism for `BoxedRead` and `BoxedWrite`.
-/// The concrete type of each half depends on the actual "files" that are 
-/// passed in to the session process's stdin/stdout. 
-/// 
+/// The concrete type of each half depends on the actual "files" that are
+/// passed in to the session process's stdin/stdout.
+///
 /// The concrete type is:
-/// 
+///
 ///   - `FdStream` for file descriptors that support non-blocking operation and polling.
 ///   - `tokio::fs::File` for regular files.
-/// 
+///
 pub type Carrier = Join<BoxedRead, BoxedWrite>;
 
 /// Takes over stdin and stdout as the carrier.

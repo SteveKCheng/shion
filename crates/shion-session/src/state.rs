@@ -1,4 +1,4 @@
-//! State shared by every task in the session process.
+//! [`ServerState`]: state shared by every task in the session process.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -15,12 +15,12 @@ use crate::settings::Settings;
 /// several tasks, possibly on different threads, use it. Rust won't compile
 /// unsynchronized shared mutation at all, so there's no way to forget it.
 #[derive(Debug)]
-pub struct State {
+pub struct ServerState {
     pub settings: Settings,
     conversations: Mutex<HashMap<u64, Arc<ConvOpen>>>,
 }
 
-impl State {
+impl ServerState {
     pub fn new(settings: Settings) -> Arc<Self> {
         Arc::new(Self {
             settings,
@@ -28,9 +28,9 @@ impl State {
         })
     }
 
-    /// Validates a `CONV_OPEN` and records the conversation. 
-    /// 
-    /// The returned [`Registration`] removes it again when dropped. On failure, 
+    /// Validates a `CONV_OPEN` and records the conversation.
+    ///
+    /// The returned [`Registration`] removes it again when dropped. On failure,
     /// returns the reason to send in `CONV_REJECT`.
     ///
     /// `self: &Arc<Self>` lets the method keep its own reference to the
@@ -75,15 +75,15 @@ impl State {
     }
 }
 
-/// Proof that a conversation is registered. 
-/// 
-/// Dropping it unregisters the conversation, however the owning task ends: 
-/// normal return, `?` error, or panic. This is RAII, as in C++, except that 
-/// the compiler also stops you from using the guard after it has been moved 
+/// Proof that a conversation is registered.
+///
+/// Dropping it unregisters the conversation, however the owning task ends:
+/// normal return, `?` error, or panic. This is RAII, as in C++, except that
+/// the compiler also stops you from using the guard after it has been moved
 /// or dropped.
 #[derive(Debug)]
 pub struct Registration {
-    state: Arc<State>,
+    state: Arc<ServerState>,
     id: u64,
 }
 

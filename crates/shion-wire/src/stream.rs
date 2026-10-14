@@ -15,19 +15,19 @@ use crate::header::{CHANNEL_SIGNAL, ChannelHeader};
 use crate::wire::Reader;
 
 /// The first message on a front-end-initiated stream.
-/// 
+///
 /// The first message is special and does not follow the format of the rest of messages
 /// in the same stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamStart {
     /// Start of a SSH channel. [`crate::Message`]s follow.
-    /// 
+    ///
     /// This header is as described in §4.1.1 of draft-michel-remote-terminal-http3.
     Channel(ChannelHeader),
 
     /// A control stream opening a new conversation. More
     /// [`ControlMessage`]s follow.
-    /// 
+    ///
     /// This message is shion-specific, used to coordinate between the front-end
     /// and the session process.  `ChannelHeader` carries a magic varint value
     /// at the beginning so it can always be distinguished from `ConvOpen`.
