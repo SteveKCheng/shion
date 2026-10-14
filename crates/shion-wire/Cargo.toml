@@ -1,0 +1,19 @@
+[package]
+name = "shion-wire"
+description = "Wire formats spoken between the shion front-end and session process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }
+futures-util = { version = "0.3", features = ["sink"] }
+
+[lints]
+workspace = true
