@@ -29,10 +29,15 @@ pub type BoxedWrite = Box<dyn AsyncWrite + Send + Unpin>;
 /// stdin and stdout joined into one `AsyncRead + AsyncWrite` value, which is
 /// the shape async-smux wants.
 ///
-/// `Box<dyn Trait>` is Rust's runtime polymorphism, like a
-/// `std::unique_ptr` to an abstract base class. We use it because the
-/// concrete type of each half (`FdStream` or `tokio::fs::File`) is only
-/// known at run time.
+/// We require run-time polymorphism for `BoxedRead` and `BoxedWrite`.
+/// The concrete type of each half depends on the actual "files" that are 
+/// passed in to the session process's stdin/stdout. 
+/// 
+/// The concrete type is:
+/// 
+///   - `FdStream` for file descriptors that support non-blocking operation and polling.
+///   - `tokio::fs::File` for regular files.
+/// 
 pub type Carrier = Join<BoxedRead, BoxedWrite>;
 
 /// Takes over stdin and stdout as the carrier.
