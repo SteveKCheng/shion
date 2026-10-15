@@ -26,19 +26,28 @@ use shion_wire::modes::{self, DISABLED_CHAR, opcode};
 use tokio::process::Command;
 use tracing::debug;
 
-/// The master side of a pty, plus the slave until a child has it.
+/// The state of an open pseudo-terminal.
 #[derive(Debug)]
 pub struct Terminal {
+    /// Master side of the pseudo-terminal.
+    /// 
     /// Used for `ioctl`s (window size, foreground process group). The I/O
     /// pumps get their own duplicate from [`Terminal::stream`].
     master: OwnedFd,
+
+    /// Slave side of the pseudo-terminal.
+    ///
     /// Held until [`Terminal::close_slave`]. Once the child has its copies,
     /// ours must be closed: the master only reports end-of-file (as `EIO`)
     /// when *every* copy of the slave is closed.
     slave: Option<OwnedFd>,
-    /// The slave's path, for `SSH_TTY`.
+
+    /// The slave's path, for setting the `SSH_TTY` environment variable.
+    ///
+    /// The session process does not use this path for anything itself.
     path: PathBuf,
-    /// The client's `TERM`.
+
+    /// The client's `TERM` environment variable to propagate.
     term: String,
 }
 
@@ -53,15 +62,23 @@ impl Terminal {
         // terminal. CLOEXEC: children only get the copies we give them.
         let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
         let master = rustix::pty::openpt(flags)?;
-        rustix::pty::grantpt(&master)?; // a no-op on Linux, but POSIX wants it
+
+        // Traditional POSIX stipulates calling grantpt to change ownership/permissions on 
+        // the slave pseudo-terminal device.  This is wholly unnecessary in sandboxes, where
+        // the slave device will have the correct ownership/permissions to begin with,
+        // and usually be reduced to a no-op.
+        rustix::pty::grantpt(&master)?;
         rustix::pty::unlockpt(&master)?;
+
         let path = PathBuf::from(OsString::from_vec(
             rustix::pty::ptsname(&master, Vec::new())?.into_bytes(),
         ));
+
         // Opens the slave through the master instead of by path, so nothing
         // racing on /dev/pts can substitute another device (Linux ≥ 4.13).
         let slave = rustix::pty::ioctl_tiocgptpeer(&master, flags)?;
 
+        // Initial terminal settings
         rustix::termios::tcsetwinsize(&slave, winsize(request.size))?;
         let mut termios = rustix::termios::tcgetattr(&slave)?;
         apply_modes(&mut termios, &request.modes);
@@ -97,7 +114,7 @@ impl Terminal {
             .stdout(slave.try_clone()?)
             .stderr(slave.try_clone()?);
 
-        // The closure owns one more copy of the slave, so it can name the
+        // This closure owns one more copy of the slave, so it can name the
         // terminal without touching raw fd numbers. `cmd` drops it after
         // spawning, and in the child it's `O_CLOEXEC`.
         let ctty = slave.try_clone()?;
@@ -112,9 +129,10 @@ impl Terminal {
             rustix::process::ioctl_tiocsctty(&ctty)?;
             Ok(())
         };
+
         // `pre_exec` runs the closure in the child between `fork` and
         // `exec`. That's `unsafe` because only async-signal-safe operations
-        // are allowed there. In particular no allocation, since another
+        // are allowed there. In particular no memory allocation, since another
         // thread may have held the allocator's lock at the moment of
         // `fork`, and the lock was copied in that state.
         #[allow(unsafe_code)]
@@ -124,6 +142,7 @@ impl Terminal {
         unsafe {
             cmd.pre_exec(become_session_leader);
         }
+
         Ok(())
     }
 
@@ -169,7 +188,8 @@ fn winsize(size: WindowSize) -> Winsize {
     }
 }
 
-/// Where an RFC 4254 mode opcode lands in `termios`.
+/// "Terminal modes" that can be requested by the client as part of opening
+/// a pseudo-terminal.
 enum Mode {
     Char(SpecialCodeIndex),
     Input(InputModes),
@@ -183,9 +203,10 @@ enum Mode {
     OutputSpeed,
 }
 
-/// Maps an opcode to its `termios` setting. Opcodes for settings Linux
-/// doesn't have (`VDSUSP`, `VSTATUS`, `VFLUSH`) map to `None`, like unknown
-/// ones.
+/// Maps an opcode (§8 of RFC 4254) to its `termios` setting. 
+/// 
+/// Opcodes for settings Linux doesn't have (`VDSUSP`, `VSTATUS`, `VFLUSH`) 
+/// map to `None`, like unknown ones.
 fn mode(op: u8) -> Option<Mode> {
     use Mode::{Char, CharSize, Control, Input, InputSpeed, Local, Output, OutputSpeed};
     // `opcode::…` are `const`s, so they can be used as patterns.
@@ -252,9 +273,10 @@ fn mode(op: u8) -> Option<Mode> {
     })
 }
 
-/// Applies an encoded modes blob to `termios`. Modes we can't apply are
-/// skipped, as OpenSSH does: a client's terminal settings are a
-/// preference, not a reason to refuse the pty.
+/// Applies an encoded terminal-modes blob (from the SSH message) to `termios`. 
+/// 
+/// Modes we can't apply are skipped, as OpenSSH does: a client's terminal settings 
+/// are a preference, not a reason to refuse the pty.
 fn apply_modes(termios: &mut Termios, blob: &[u8]) {
     for (op, arg) in modes::decode(blob) {
         let on = arg != 0;
