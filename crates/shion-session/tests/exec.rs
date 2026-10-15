@@ -9,9 +9,10 @@ use common::{
     CLIENT_ADDRESS, Harness, SERVER_ADDRESS, Transport, collect, exec, exit_status, request, within,
 };
 use futures_util::{SinkExt, StreamExt};
-use shion_wire::header::channel_type;
 use shion_wire::message::{WindowSize, X11Request, open_failure};
-use shion_wire::{ChannelHeader, ChannelRequest, ControlMessage, Message};
+use shion_wire::{
+    ChannelHeader, ChannelKind, ChannelRequest, ControlMessage, GlobalRequest, Message,
+};
 
 #[tokio::test]
 async fn exec_stdout_stderr_and_exit_status() {
@@ -304,7 +305,7 @@ async fn channel_needs_an_open_conversation() {
         let harness = Harness::start();
         let header = |conversation_id| ChannelHeader {
             conversation_id,
-            channel_type: channel_type::SESSION.into(),
+            kind: ChannelKind::Session,
             max_packet_size: 32_768,
         };
 
@@ -341,7 +342,7 @@ async fn unknown_channel_type_is_refused() {
         let _control = harness.conversation(1).await;
         let header = ChannelHeader {
             conversation_id: 1,
-            channel_type: channel_type::DIRECT_TCPIP.into(),
+            kind: ChannelKind::Other("direct-streamlocal@openssh.com".into()),
             max_packet_size: 32_768,
         };
         let (_, reply) = harness.try_channel(header).await;
@@ -391,14 +392,16 @@ async fn conversations_are_validated() {
 }
 
 #[tokio::test]
-async fn global_requests_are_refused_for_now() {
+async fn unknown_global_requests_are_refused() {
     within(async {
         let harness = Harness::start();
         let mut control = harness.conversation(1).await;
         let request = ControlMessage::GlobalRequest {
-            name: "tcpip-forward".into(),
             want_reply: true,
-            body: Bytes::new(),
+            request: GlobalRequest::Other {
+                name: "keepalive@openssh.com".into(),
+                body: Bytes::new(),
+            },
         };
         control.send(request).await.unwrap();
         assert_eq!(

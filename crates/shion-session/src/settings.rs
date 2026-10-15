@@ -43,6 +43,21 @@ pub struct Settings {
     #[arg(long = "subsystem", value_name = "NAME=COMMAND", value_parser = parse_assignment)]
     pub subsystems: Vec<(String, String)>,
 
+    /// Allows local forwarding (`direct-tcpip`, `ssh -L`) to HOST:PORT
+    /// (repeatable). HOST is matched as the client wrote it, before name
+    /// resolution, and may use `*` and `?`; PORT is a number or `*`.
+    /// Without it, local forwarding is refused. Example: `'localhost:*'`.
+    #[arg(long = "permit-open", value_name = "HOST:PORT", value_parser = parse_permission)]
+    pub permit_open: Vec<Permission>,
+
+    /// Allows remote forwarding (`tcpip-forward`, `ssh -R`) to listen on
+    /// HOST:PORT (repeatable), matched like `--permit-open` against the
+    /// requested bind address: `localhost`, an address, or the empty string
+    /// for all addresses (which only `*` matches). Port 0 asks for any free
+    /// port, so it needs `*`. Without it, remote forwarding is refused.
+    #[arg(long = "permit-listen", value_name = "HOST:PORT", value_parser = parse_permission)]
+    pub permit_listen: Vec<Permission>,
+
     /// Exits once no conversation has been open for this many seconds
     /// (fractions allowed), counting from startup too. Without it, the
     /// process runs until the front-end closes its stdin/stdout.
@@ -56,6 +71,16 @@ impl Settings {
         self.accept_env
             .iter()
             .any(|pattern| glob_match(pattern.as_bytes(), name))
+    }
+
+    /// Whether `direct-tcpip` may connect to `host` and `port`.
+    pub fn permits_open(&self, host: &str, port: u16) -> bool {
+        self.permit_open.iter().any(|p| p.allows(host, port))
+    }
+
+    /// Whether `tcpip-forward` may listen on `address` and `port`.
+    pub fn permits_listen(&self, address: &str, port: u16) -> bool {
+        self.permit_listen.iter().any(|p| p.allows(address, port))
     }
 
     /// The command for subsystem `name`, if there is one. The first
@@ -76,6 +101,40 @@ fn parse_assignment(s: &str) -> Result<(String, String), String> {
         Some((name, value)) if !name.is_empty() => Ok((name.into(), value.into())),
         _ => Err(format!("expected NAME=VALUE, got {s:?}")),
     }
+}
+
+/// A `HOST:PORT` pattern from `--permit-open` or `--permit-listen`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Permission {
+    host: String,
+    /// `None` for `*`.
+    port: Option<u16>,
+}
+
+impl Permission {
+    fn allows(&self, host: &str, port: u16) -> bool {
+        self.port.is_none_or(|p| p == port) && glob_match(self.host.as_bytes(), host.as_bytes())
+    }
+}
+
+/// Parses `HOST:PORT`. The last colon separates them, so an IPv6 address
+/// works as HOST, with or without brackets: `::1:22`, `[::1]:22`.
+fn parse_permission(s: &str) -> Result<Permission, String> {
+    let (host, port) = s
+        .rsplit_once(':')
+        .ok_or_else(|| format!("expected HOST:PORT, got {s:?}"))?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let port = match port {
+        "*" => None,
+        _ => Some(port.parse().map_err(|e| format!("port {port:?}: {e}"))?),
+    };
+    Ok(Permission {
+        host: host.to_owned(),
+        port,
+    })
 }
 
 /// Parses a non-negative number of seconds, such as `300` or `0.5`.
@@ -126,7 +185,27 @@ fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::glob_match;
+    use super::{glob_match, parse_permission};
+
+    #[test]
+    fn permissions() {
+        let p = parse_permission("localhost:*").unwrap();
+        assert!(p.allows("localhost", 8080));
+        assert!(!p.allows("127.0.0.1", 8080));
+
+        let p = parse_permission("[::1]:22").unwrap();
+        assert!(p.allows("::1", 22));
+        assert!(!p.allows("::1", 23));
+        assert_eq!(parse_permission("::1:22"), Ok(p));
+
+        let p = parse_permission("*:80").unwrap();
+        assert!(p.allows("", 80));
+        assert!(p.allows("example.com", 80));
+
+        assert!(parse_permission("localhost").is_err());
+        assert!(parse_permission("localhost:http").is_err());
+        assert!(parse_permission("localhost:65536").is_err());
+    }
 
     #[test]
     fn literal_patterns() {

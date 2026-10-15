@@ -2,9 +2,9 @@
 //! rules that come from length delimiting.
 
 use bytes::{Bytes, BytesMut};
-use shion_wire::control::{PROTOCOL_VERSION, attr, control_type};
+use shion_wire::control::{ForwardAddress, PROTOCOL_VERSION, attr, control_type};
 use shion_wire::wire::{put_string, put_varint};
-use shion_wire::{ControlMessage, ConvAccept, ConvOpen, DecodeError, Reader, Wire};
+use shion_wire::{ControlMessage, ConvAccept, ConvOpen, DecodeError, GlobalRequest, Reader, Wire};
 
 const MAX_LEN: usize = 1 << 20;
 
@@ -56,9 +56,25 @@ fn roundtrips() {
         reason: "user mismatch".into(),
     });
     roundtrip(&ControlMessage::GlobalRequest {
-        name: "tcpip-forward".into(),
         want_reply: true,
-        body: Bytes::from_static(b"\x00\x00\x1f\x90"),
+        request: GlobalRequest::TcpipForward(ForwardAddress {
+            address: "localhost".into(),
+            port: 8080,
+        }),
+    });
+    roundtrip(&ControlMessage::GlobalRequest {
+        want_reply: false,
+        request: GlobalRequest::CancelTcpipForward(ForwardAddress {
+            address: String::new(),
+            port: 0,
+        }),
+    });
+    roundtrip(&ControlMessage::GlobalRequest {
+        want_reply: true,
+        request: GlobalRequest::Other {
+            name: "keepalive@openssh.com".into(),
+            body: Bytes::from_static(b"opaque"),
+        },
     });
     roundtrip(&ControlMessage::RequestSuccess { body: Bytes::new() });
     roundtrip(&ControlMessage::RequestFailure);

@@ -7,7 +7,7 @@ use shion_wire::message::{
     EXTENDED_DATA_STDERR, ExitSignal, PtyRequest, WindowSize, X11Request, msg,
 };
 use shion_wire::wire::{put_bool, put_string, put_varint};
-use shion_wire::{ChannelHeader, ChannelRequest, DecodeError, Message, Reader, Wire};
+use shion_wire::{ChannelHeader, ChannelKind, ChannelRequest, DecodeError, Message, Reader, Wire};
 
 const MAX_LEN: usize = 1 << 20;
 
@@ -74,7 +74,7 @@ fn request(want_reply: bool, request: ChannelRequest) -> Message {
 fn channel_header() {
     let header = ChannelHeader {
         conversation_id: 4,
-        channel_type: "session".into(),
+        kind: ChannelKind::Session,
         max_packet_size: 30_000,
     };
     check(

@@ -1,6 +1,6 @@
 # shion — design, part 1: the session process
 
-Status: decisions of 2026-10-14 incorporated (see §8); M0–M3 done
+Status: decisions of 2026-10-14 incorporated (see §8); M0–M4 done
 
 ## 1. Goals and non-goals
 
@@ -186,8 +186,9 @@ Where sshoq has drifted from the draft, we don't follow it:
   does not arrive" comment, and `ForwardingRequest.Write` copies into the
   wrong buffer. These headers also carry only IP addresses, while SSH2's
   `direct-tcpip` carries a *host name*, which would have to be resolved
-  inside the sandbox. We'll decide the forwarding formats in M4, and they
-  won't be part of the M0 codec.
+  inside the sandbox. Our formats (decided in M4) are in §5.5: RFC 4254's
+  fields, SSH3-encoded, under the SSH2 channel type names, so sshoq's
+  `direct-tcp` is simply an unknown channel type to us.
 
 ### 4.3 Control stream (per conversation)
 
@@ -205,7 +206,7 @@ connection):
 ```
 192 CONV_OPEN      varint version, varint conversation id,
                    attributes: varint n, n × (string key, string value)
-80  GLOBAL_REQUEST string name, bool want-reply, bytes body   (M4)
+80  GLOBAL_REQUEST string name, bool want-reply, request-specific fields
 ```
 
 Session → front-end:
@@ -214,7 +215,7 @@ Session → front-end:
 193 CONV_ACCEPT    varint version, string-list channel types,
                    string-list request types
 194 CONV_REJECT    string reason
-81  REQUEST_SUCCESS bytes body   (reply to a global request)
+81  REQUEST_SUCCESS request-specific fields (reply to a global request)
 82  REQUEST_FAILURE
 ```
 
@@ -417,18 +418,56 @@ about 200 lines and the most Unix-heavy part of the project:
 Linux-only for now, in a `pty` module whose `Terminal` type is the seam
 where a ConPTY backend could slot in later.
 
-### 5.5 Port forwarding (M4)
+### 5.5 Port forwarding
 
-- `direct-tcpip`: the session connects *from inside the sandbox's network
-  namespace*. With `--unshare-net` that means only the sandbox's loopback,
-  which is exactly right for "let me reach the dev server my agent started".
-  Policy can forbid it outright.
-- `tcpip-forward` (global request on the control stream): the session listens
-  inside the sandbox and opens a `forwarded-tcpip` stream per accepted
-  connection.
+- `direct-tcpip` (`ssh -L`): the session connects *from inside the
+  sandbox's network namespace*, resolving host names there too. With
+  `--unshare-net` that means only the sandbox's loopback, which is exactly
+  right for "let me reach the dev server my agent started". Allowed only
+  for the `HOST:PORT` patterns of `--permit-open` (like OpenSSH's
+  `PermitOpen`, matched against the host name as the client wrote it).
+  Connection failures are reported as `CONNECT_FAILED`.
+- `tcpip-forward` (`ssh -R`, a global request on the control stream): the
+  session listens inside the sandbox and opens a `forwarded-tcpip` stream
+  per accepted connection, naming the conversation in its header. Allowed
+  only for the `--permit-listen` patterns. `""` and `*` listen on every
+  address, `localhost` on both loopbacks; port 0 picks a free port and the
+  reply returns it. `cancel-tcpip-forward` stops listening but keeps the
+  connections already forwarded, as in OpenSSH.
+- Each direction of a forwarded connection ends separately: the peer's FIN
+  becomes a TCP half-close, and TCP end-of-file becomes our FIN.
+- When the conversation ends, its listeners close and its forwarded
+  connections are cut, in both directions, just as its processes get
+  SIGHUP (§4.3).
 - Reaching *out* of the sandbox to arbitrary hosts is deliberately not the
   session's job. If we ever want it, the front-end does it on the host
   network, policy permitting.
+
+Wire formats (shion's; SSH3 has nothing settled, see §4.2). The channel
+header's type-specific fields, after the max packet size:
+
+```
+direct-tcpip     string host to connect to, varint port,
+                 string originator address, varint originator port
+forwarded-tcpip  string address that was connected (as requested in
+                 tcpip-forward), varint port,
+                 string originator address, varint originator port
+```
+
+and the global requests' fields, after `want-reply`:
+
+```
+tcpip-forward         string address to bind, varint port
+cancel-tcpip-forward  string address to bind, varint port
+REQUEST_SUCCESS       varint bound port (only if port 0 was requested)
+```
+
+Ports must fit in 16 bits. In Rust, the header's channel type is an enum
+(`ChannelKind`) carrying these fields, so a `direct-tcpip` header without
+endpoints can't be represented at all.
+
+Not supported (yet): Unix-socket forwarding (`direct-streamlocal@openssh.com`
+and friends), and UDP.
 
 ### 5.6 Command line: per-user settings
 
@@ -445,6 +484,7 @@ bwrap --unshare-all --die-with-parent \
          --setenv PATH=/usr/local/bin:/usr/bin \
          --accept-env 'LANG' --accept-env 'LC_*' \
          --subsystem sftp=/usr/libexec/openssh/sftp-server \
+         --permit-open 'localhost:*' --permit-listen 'localhost:*' \
          --linger 300
 ```
 
@@ -456,7 +496,8 @@ bwrap --unshare-all --die-with-parent \
 | `--setenv NAME=VALUE` (rep.) | base environment (built from scratch, nothing inherited)  |
 | `--accept-env GLOB` (rep.)   | which client `env` requests are honored                   |
 | `--subsystem NAME=CMD` (rep.)| subsystem table                                           |
-| `--allow-forwarding …` (M4)  | port-forwarding permissions                               |
+| `--permit-open HOST:PORT` (rep.) | where `direct-tcpip` may connect (§5.5)               |
+| `--permit-listen HOST:PORT` (rep.) | where `tcpip-forward` may listen (§5.5)             |
 | `--linger SECONDS`           | exit after this long without conversations (see below)    |
 
 `--linger` counts from startup too, and any conversation opening or closing
@@ -465,6 +506,8 @@ carrier. Processes that outlived their conversation (`nohup`, daemons) live
 until then; with bwrap, the session process exiting tears the sandbox down.
 A front-end that opens a conversation just as the session gives up sees the
 carrier close and must start a new session process, as after a crash.
+The front-end knows when it opens conversations, so it could implement
+lingering without that race; `--linger` may move there (undecided).
 
 Everything on this command line is visible inside the sandbox
 (`/proc/<pid>/cmdline`), which is fine because the session process holds no
@@ -511,7 +554,7 @@ Main dependencies: `tokio`, `tokio-util`, `bytes`, `async-smux`, `rustix`,
 | M1 | session: carrier, control stream, `exec` over pipes, `exit-status` (done)    | integration test spawns binary, drives smux      |
 | M2 | pty, `shell`, `window-change`, `signal`, terminal modes; `shion-attach` (done) | interactive `bash`, `vim`, resize, `^C`          |
 | M3 | subsystems (sftp), env allowlist, conversation teardown, `--linger` (done)   | `sftp -D` via shion-attach; teardown tests       |
-| M4 | `direct-tcpip`, `tcpip-forward` / `forwarded-tcpip`                          | curl through a forward                           |
+| M4 | `direct-tcpip`, `tcpip-forward` / `forwarded-tcpip` (done)                   | TCP clients and servers in the tests             |
 | M5 | `shion-front`: russh, user DB, bwrap policy, SSH2⇄SSH3 translation           | real `ssh`, `sftp`, `ssh -L/-R` against it       |
 
 ## 8. Decisions (2026-10-14)
@@ -522,6 +565,6 @@ Main dependencies: `tokio`, `tokio-util`, `bytes`, `async-smux`, `rustix`,
    logins. One per connection is a front-end policy variant.
 3. **Fidelity:** channel streams stay byte-compatible with the SSH3 draft and
    sshoq, unknown-request wart included. Exceptions: sshoq's own `sftp`
-   request, and the forwarding headers, which get decided in M4.
+   request, and the forwarding headers, which are our own (§5.5).
 4. **Settings:** per-user settings on the session process's command line
    (§5.6). Per-connection facts go in CONV_OPEN attributes (§4.3).

@@ -35,7 +35,6 @@ use futures_util::{SinkExt, StreamExt};
 use rustix::process::{Pid, Signal};
 use shion_wire::codec::MessageCodec;
 use shion_wire::control::attr;
-use shion_wire::header::channel_type;
 use shion_wire::message::{EXTENDED_DATA_STDERR, ExitSignal, open_failure};
 use shion_wire::{ChannelHeader, ChannelRequest, CodecError, ConvOpen, Message};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -51,8 +50,8 @@ use crate::signals;
 use crate::state::{Conversation, ServerState};
 
 /// Largest data payload we accept per message, announced in our
-/// `CHANNEL_OPEN_CONFIRMATION`.
-const OUR_MAX_PACKET: u64 = 32 * 1024;
+/// `CHANNEL_OPEN_CONFIRMATION` (or our header, for channels we open).
+pub const OUR_MAX_PACKET: u64 = 32 * 1024;
 
 /// `PATH` for children unless `--setenv PATH=…` says otherwise.
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -63,10 +62,12 @@ const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// keep the channel open forever.
 const TERMINAL_LINGER: Duration = Duration::from_millis(100);
 
-type Incoming = SplitStream<Framed<Stream, MessageCodec>>;
-type Outgoing = SplitSink<Framed<Stream, MessageCodec>, Message>;
-type Out = mpsc::Sender<Message>;
+pub type Incoming = SplitStream<Framed<Stream, MessageCodec>>;
+pub type Outgoing = SplitSink<Framed<Stream, MessageCodec>, Message>;
+/// Queue of messages for the task that owns [`Outgoing`].
+pub type Out = mpsc::Sender<Message>;
 
+/// Runs a `session` channel.
 pub async fn run(
     framed: Framed<Stream, MessageCodec>,
     header: ChannelHeader,
@@ -76,17 +77,16 @@ pub async fn run(
     // read while another writes.
     let (mut sink, mut incoming) = framed.split();
 
-    let conversation = match check_open(&header, &state) {
+    let conversation = match conversation_of(&header, &state) {
         Ok(conversation) => conversation,
-        Err((reason, description)) => {
-            warn!(conversation = header.conversation_id, channel_type = header.channel_type, %description, "refusing channel");
-            sink.send(Message::OpenFailure {
-                reason,
+        Err(description) => {
+            return refuse(
+                sink,
+                &header,
+                open_failure::ADMINISTRATIVELY_PROHIBITED,
                 description,
-                language: String::new(),
-            })
-            .await?;
-            return sink.close().await;
+            )
+            .await;
         }
     };
     sink.send(Message::OpenConfirmation {
@@ -94,9 +94,7 @@ pub async fn run(
     })
     .await?;
 
-    // Never send more per message than the peer accepts, nor more than we'd
-    // want to buffer.
-    let packet_size = usize::try_from(header.max_packet_size.clamp(1, OUR_MAX_PACKET)).unwrap_or(1);
+    let packet_size = packet_size(header.max_packet_size);
 
     let (out, out_rx) = mpsc::channel(32);
     let writer = tokio::spawn(write_messages(sink, out_rx));
@@ -126,28 +124,42 @@ pub async fn run(
     Ok(())
 }
 
-/// Decides whether to accept the channel. On refusal, returns the reason
-/// code and description for `CHANNEL_OPEN_FAILURE`.
-fn check_open(
+/// Finds the open conversation a channel belongs to. If there's none,
+/// returns the description for `CHANNEL_OPEN_FAILURE`.
+pub fn conversation_of(
     header: &ChannelHeader,
     state: &ServerState,
-) -> Result<Arc<Conversation>, (u64, String)> {
-    if header.channel_type != channel_type::SESSION {
-        return Err((
-            open_failure::UNKNOWN_CHANNEL_TYPE,
-            format!("unsupported channel type {:?}", header.channel_type),
-        ));
-    }
-    state.conversation(header.conversation_id).ok_or_else(|| {
-        (
-            open_failure::ADMINISTRATIVELY_PROHIBITED,
-            format!("no conversation {}", header.conversation_id),
-        )
+) -> Result<Arc<Conversation>, String> {
+    state
+        .conversation(header.conversation_id)
+        .ok_or_else(|| format!("no conversation {}", header.conversation_id))
+}
+
+/// Refuses a channel with `CHANNEL_OPEN_FAILURE`, then closes our side.
+pub async fn refuse(
+    mut sink: Outgoing,
+    header: &ChannelHeader,
+    reason: u64,
+    description: String,
+) -> Result<(), CodecError> {
+    warn!(conversation = header.conversation_id, channel_type = header.kind.name(), %description, "refusing channel");
+    sink.send(Message::OpenFailure {
+        reason,
+        description,
+        language: String::new(),
     })
+    .await?;
+    sink.close().await
+}
+
+/// How much to send per data message, given the peer's maximum: never more
+/// than the peer accepts, nor more than we'd want to buffer.
+pub fn packet_size(peer_max: u64) -> usize {
+    usize::try_from(peer_max.clamp(1, OUR_MAX_PACKET)).unwrap_or(1)
 }
 
 /// Owns the write half: sends everything queued on `rx`, then FIN.
-async fn write_messages(
+pub async fn write_messages(
     mut sink: Outgoing,
     mut rx: mpsc::Receiver<Message>,
 ) -> Result<(), CodecError> {
@@ -158,7 +170,7 @@ async fn write_messages(
 }
 
 /// Answers a request if the peer asked for an answer.
-async fn reply(out: &Out, want_reply: bool, ok: bool) {
+pub async fn reply(out: &Out, want_reply: bool, ok: bool) {
     if want_reply {
         // If the writer is gone, the stream is dead and nobody is listening.
         let _ = out
@@ -549,7 +561,7 @@ async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: impl AsyncWrite + 
 ///
 /// `out` is the MPSC queue where this function will push the output
 /// SSH messages into.
-async fn pump_output(
+pub async fn pump_output(
     mut from: impl AsyncRead + Unpin,
     out: Out,
     data_type: Option<u64>,

@@ -22,9 +22,9 @@ pub mod wire;
 
 use bytes::BytesMut;
 
-pub use control::{ControlMessage, ConvAccept, ConvOpen};
+pub use control::{ControlMessage, ConvAccept, ConvOpen, GlobalRequest};
 pub use error::{CodecError, DecodeError, EncodeError};
-pub use header::ChannelHeader;
+pub use header::{ChannelHeader, ChannelKind};
 pub use message::{ChannelRequest, Message};
 pub use stream::StreamStart;
 pub use wire::Reader;

@@ -24,6 +24,9 @@ pub enum DecodeError {
     #[error("{0}: malformed (shorter than its fields)")]
     Malformed(&'static str),
 
+    #[error("{what}: value {value} is out of range")]
+    OutOfRange { what: &'static str, value: u64 },
+
     #[error("not an SSH3 channel: signal value {0:#x}")]
     BadChannelSignal(u64),
 

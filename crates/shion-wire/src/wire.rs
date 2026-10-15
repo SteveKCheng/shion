@@ -160,6 +160,19 @@ impl<'a> Reader<'a> {
         Ok(v)
     }
 
+    /// Consumes a varint that must be a TCP or UDP port number.
+    ///
+    /// # Errors
+    /// [`DecodeError::Incomplete`] if the varint is cut off,
+    /// [`DecodeError::OutOfRange`] if it exceeds 65535.
+    pub fn port(&mut self) -> Result<u16, DecodeError> {
+        let value = self.varint()?;
+        u16::try_from(value).map_err(|_| DecodeError::OutOfRange {
+            what: "port",
+            value,
+        })
+    }
+
     /// Consumes a string and returns its bytes without copying. `what`
     /// names the field in error messages.
     ///

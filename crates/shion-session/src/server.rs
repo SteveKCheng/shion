@@ -4,21 +4,25 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_smux::MuxBuilder;
 use async_smux::error::MuxError;
+use async_smux::{MuxBuilder, MuxConnector};
 use futures_util::StreamExt;
 use shion_wire::codec::{ControlCodec, MessageCodec, StreamStartCodec};
-use shion_wire::{CodecError, StreamStart};
+use shion_wire::message::open_failure;
+use shion_wire::{ChannelKind, CodecError, StreamStart};
 use tokio::sync::watch;
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
 use crate::carrier::Carrier;
 use crate::state::ServerState;
-use crate::{channel, control};
+use crate::{channel, control, forward};
 
 /// One smux stream over our carrier.
 pub type Stream = shion_mux::Stream<Carrier>;
+
+/// Opens smux streams to the front-end; cloning it is cheap.
+pub type Connector = MuxConnector<Carrier>;
 
 /// Serves the front-end until the carrier closes, or until `--linger`
 /// says we've been idle long enough.
@@ -46,8 +50,9 @@ pub async fn serve(carrier: Carrier, state: Arc<ServerState>) {
                     break;
                 };
                 let state = Arc::clone(&state);
+                let connector = connector.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_stream(stream.into(), state).await {
+                    if let Err(e) = handle_stream(stream.into(), state, connector).await {
                         warn!(error = %e, "stream failed");
                     }
                 });
@@ -109,7 +114,11 @@ async fn idle_for(mut open_count: watch::Receiver<usize>, linger: Option<Duratio
 
 /// Reads the first message of a stream to find out what kind it is,
 /// then dispatches to the appropriate handler for the stream.
-async fn handle_stream(stream: Stream, state: Arc<ServerState>) -> Result<(), CodecError> {
+async fn handle_stream(
+    stream: Stream,
+    state: Arc<ServerState>,
+    connector: Connector,
+) -> Result<(), CodecError> {
     let mut framed = Framed::new(stream, StreamStartCodec::default());
 
     // `transpose` turns Option<Result<T, E>> into Result<Option<T>, E>, so
@@ -123,10 +132,32 @@ async fn handle_stream(stream: Stream, state: Arc<ServerState>) -> Result<(), Co
     // first message.
     match start {
         StreamStart::Control(open) => {
-            control::run(framed.map_codec(|_| ControlCodec::default()), open, state).await
+            let framed = framed.map_codec(|_| ControlCodec::default());
+            control::run(framed, open, state, connector).await
         }
         StreamStart::Channel(header) => {
-            channel::run(framed.map_codec(|_| MessageCodec::default()), header, state).await
+            let framed = framed.map_codec(|_| MessageCodec::default());
+            match &header.kind {
+                ChannelKind::Session => channel::run(framed, header, state).await,
+                ChannelKind::DirectTcpip(target) => {
+                    // A copy, so `header` can be handed over whole: the
+                    // borrow of `header.kind` ends with this line.
+                    let target = target.clone();
+                    forward::direct(framed, header, target, state).await
+                }
+                // `forwarded-tcpip` is ours to open, not the front-end's.
+                ChannelKind::ForwardedTcpip(_) | ChannelKind::Other(_) => {
+                    let (sink, _) = framed.split();
+                    let description = format!("unsupported channel type {:?}", header.kind.name());
+                    channel::refuse(
+                        sink,
+                        &header,
+                        open_failure::UNKNOWN_CHANNEL_TYPE,
+                        description,
+                    )
+                    .await
+                }
+            }
         }
     }
 }

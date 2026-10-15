@@ -4,13 +4,13 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use shion_wire::codec::{HeaderCodec, MessageCodec};
-use shion_wire::{ChannelHeader, ChannelRequest, CodecError, Message};
+use shion_wire::{ChannelHeader, ChannelKind, ChannelRequest, CodecError, Message};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 fn header() -> ChannelHeader {
     ChannelHeader {
         conversation_id: 1,
-        channel_type: "session".into(),
+        kind: ChannelKind::Session,
         max_packet_size: 32_768,
     }
 }

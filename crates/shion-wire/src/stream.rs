@@ -62,7 +62,7 @@ impl Wire for StreamStart {
 mod tests {
     use super::*;
     use crate::control::PROTOCOL_VERSION;
-    use crate::header::channel_type;
+    use crate::header::ChannelKind;
 
     fn roundtrip(start: &StreamStart) {
         let mut buf = BytesMut::new();
@@ -76,7 +76,7 @@ mod tests {
     fn both_kinds_roundtrip() {
         roundtrip(&StreamStart::Channel(ChannelHeader {
             conversation_id: 3,
-            channel_type: channel_type::SESSION.into(),
+            kind: ChannelKind::Session,
             max_packet_size: 32_768,
         }));
         roundtrip(&StreamStart::Control(ConvOpen {

@@ -27,10 +27,11 @@ use futures_util::{SinkExt, StreamExt};
 use rustix::termios::{InputModes, OptionalActions, SpecialCodeIndex, Termios};
 use shion_wire::codec::{ControlCodec, MessageCodec, StreamStartCodec};
 use shion_wire::control::{PROTOCOL_VERSION, attr};
-use shion_wire::header::channel_type;
 use shion_wire::message::{EXTENDED_DATA_STDERR, ExitSignal, PtyRequest, WindowSize};
 use shion_wire::modes::{self, DISABLED_CHAR, opcode};
-use shion_wire::{ChannelHeader, ChannelRequest, ControlMessage, ConvOpen, Message, StreamStart};
+use shion_wire::{
+    ChannelHeader, ChannelKind, ChannelRequest, ControlMessage, ConvOpen, Message, StreamStart,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
@@ -248,7 +249,7 @@ async fn open_conversation(
 async fn open_session(connector: &MuxConnector<UnixStream>) -> io::Result<Channel> {
     let header = ChannelHeader {
         conversation_id: 1,
-        channel_type: channel_type::SESSION.into(),
+        kind: ChannelKind::Session,
         max_packet_size: PACKET_SIZE as u64,
     };
     let mut framed = Framed::new(connect(connector)?, StreamStartCodec::default());

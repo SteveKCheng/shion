@@ -13,11 +13,12 @@ use std::time::Duration;
 use async_smux::{MuxAcceptor, MuxBuilder, MuxConnector};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use shion_wire::codec::{ControlCodec, MessageCodec, StreamStartCodec};
+use shion_wire::codec::{ControlCodec, HeaderCodec, MessageCodec, StreamStartCodec};
 use shion_wire::control::{PROTOCOL_VERSION, attr};
-use shion_wire::header::channel_type;
 use shion_wire::message::{EXTENDED_DATA_STDERR, PtyRequest, WindowSize};
-use shion_wire::{ChannelHeader, ChannelRequest, ControlMessage, ConvOpen, Message, StreamStart};
+use shion_wire::{
+    ChannelHeader, ChannelKind, ChannelRequest, ControlMessage, ConvOpen, Message, StreamStart,
+};
 use tempfile::TempDir;
 use tokio::io::{AsyncRead, AsyncWrite, Join};
 use tokio::process::{Child, Command};
@@ -178,7 +179,7 @@ impl Harness {
     ) -> Channel {
         let header = ChannelHeader {
             conversation_id,
-            channel_type: channel_type::SESSION.into(),
+            kind: ChannelKind::Session,
             max_packet_size,
         };
         let (channel, reply) = self.try_channel(header).await;
@@ -187,6 +188,14 @@ impl Harness {
             "{reply:?}"
         );
         channel
+    }
+
+    /// Accepts a channel that the session opened, and returns its header.
+    pub async fn accept_channel(&mut self) -> (ChannelHeader, Channel) {
+        let stream = Stream::from(self.acceptor.accept().await.expect("carrier closed"));
+        let mut framed = Framed::new(stream, HeaderCodec::default());
+        let header = framed.next().await.expect("stream closed").unwrap();
+        (header, framed.map_codec(|_| MessageCodec::default()))
     }
 
     /// Whether the session process has exited.

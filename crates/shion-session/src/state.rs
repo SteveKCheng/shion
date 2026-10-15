@@ -7,6 +7,7 @@ use rustix::process::{Pid, Signal};
 use shion_wire::ConvOpen;
 use shion_wire::control::{PROTOCOL_VERSION, attr};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::settings::Settings;
@@ -63,12 +64,13 @@ impl ServerState {
         if table.contains_key(&id) {
             return Err(format!("conversation {id} already exists"));
         }
-        table.insert(id, Arc::new(Conversation::new(open)));
+        let conversation = Arc::new(Conversation::new(open));
+        table.insert(id, Arc::clone(&conversation));
         // `send_replace` stores the value even if nobody is watching.
         self.open_count.send_replace(table.len());
         Ok(Registration {
             state: Arc::clone(self),
-            id,
+            conversation,
         })
     }
 
@@ -102,19 +104,23 @@ impl ServerState {
 #[derive(Debug)]
 pub struct Registration {
     state: Arc<ServerState>,
-    id: u64,
+    conversation: Arc<Conversation>,
+}
+
+impl Registration {
+    pub fn conversation(&self) -> &Arc<Conversation> {
+        &self.conversation
+    }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
         let mut table = self.state.table();
-        let conversation = table.remove(&self.id);
+        table.remove(&self.conversation.id());
         self.state.open_count.send_replace(table.len());
         // Unlock before signalling: no need to hold up other tasks.
         drop(table);
-        if let Some(conversation) = conversation {
-            conversation.hang_up();
-        }
+        self.conversation.end();
     }
 }
 
@@ -125,6 +131,9 @@ pub struct Conversation {
     /// Process groups started by this conversation's channels and still
     /// being supervised, or `None` once the conversation has ended.
     groups: Mutex<Option<HashSet<Pid>>>,
+    /// Cancelled when the conversation ends. Tasks that don't run a process
+    /// (port forwarding) wait on it to know when to stop.
+    ended: CancellationToken,
 }
 
 impl Conversation {
@@ -132,6 +141,7 @@ impl Conversation {
         Self {
             open,
             groups: Mutex::new(Some(HashSet::new())),
+            ended: CancellationToken::new(),
         }
     }
 
@@ -164,9 +174,16 @@ impl Conversation {
         }
     }
 
-    /// Ends the conversation: sends `SIGHUP` to every process group it
-    /// started that is still being supervised, as a terminal hangup would.
-    fn hang_up(&self) {
+    /// Completes when the conversation has ended (at once if it has).
+    pub async fn ended(&self) {
+        self.ended.cancelled().await;
+    }
+
+    /// Ends the conversation: tells port forwarding to stop, and sends
+    /// `SIGHUP` to every process group it started that is still being
+    /// supervised, as a terminal hangup would.
+    fn end(&self) {
+        self.ended.cancel();
         // `take` leaves `None` behind, so nothing is tracked from now on.
         let Some(groups) = self.groups().take() else {
             return;

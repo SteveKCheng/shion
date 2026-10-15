@@ -33,6 +33,12 @@ pub mod control_type {
     pub const CONV_REJECT: u64 = 194;
 }
 
+/// Global request names (RFC 4254 §7.1).
+pub mod global_request_type {
+    pub const TCPIP_FORWARD: &str = "tcpip-forward";
+    pub const CANCEL_TCPIP_FORWARD: &str = "cancel-tcpip-forward";
+}
+
 /// Well-known keys for [`ConvOpen::attributes`].
 pub mod attr {
     /// App-level user name; the session checks it against its `--user`.
@@ -87,13 +93,14 @@ pub enum ControlMessage {
     ConvReject {
         reason: String,
     },
-    /// An SSH2 global request (e.g. `tcpip-forward`). The body's format
-    /// depends on the request name and will be pinned down in M4.
+    /// An SSH2 global request (e.g. `tcpip-forward`), on the control
+    /// stream of the conversation (connection) it belongs to.
     GlobalRequest {
-        name: String,
         want_reply: bool,
-        body: Bytes,
+        request: GlobalRequest,
     },
+    /// Reply to a global request. For `tcpip-forward` with port 0, the body
+    /// is the port that was allocated (a varint); otherwise it's empty.
     RequestSuccess {
         body: Bytes,
     },
@@ -103,6 +110,63 @@ pub enum ControlMessage {
         msg_type: u64,
         body: Bytes,
     },
+}
+
+/// The payload of a [`ControlMessage::GlobalRequest`]:
+///
+/// ```text
+/// string  request name
+/// bool    want reply
+/// ...     request-specific fields
+/// ```
+///
+/// Being inside a length-delimited control message, a request we don't
+/// know can be skipped, unlike a channel request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlobalRequest {
+    /// `tcpip-forward`: listen on `address` and `port` (0 = pick one), and
+    /// open a `forwarded-tcpip` channel for each connection. Fields as in
+    /// RFC 4254 §7.1, with a varint port: `string address, varint port`.
+    TcpipForward(ForwardAddress),
+    /// `cancel-tcpip-forward`: stop listening (same fields).
+    CancelTcpipForward(ForwardAddress),
+    /// Any other request; `body` is everything after `want reply`.
+    Other { name: String, body: Bytes },
+}
+
+/// Where a `tcpip-forward` listens.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ForwardAddress {
+    /// As in RFC 4254: `""` means every address, `"localhost"` the loopback
+    /// addresses, anything else a host name or address to bind to.
+    pub address: String,
+    pub port: u16,
+}
+
+impl GlobalRequest {
+    /// The request name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::TcpipForward(_) => global_request_type::TCPIP_FORWARD,
+            Self::CancelTcpipForward(_) => global_request_type::CANCEL_TCPIP_FORWARD,
+            Self::Other { name, .. } => name,
+        }
+    }
+}
+
+impl ForwardAddress {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            address: r.string("forward address")?,
+            port: r.port()?,
+        })
+    }
+
+    fn encode(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        put_string(dst, &self.address)?;
+        put_varint(dst, self.port.into())
+    }
 }
 
 impl Wire for ControlMessage {
@@ -141,13 +205,16 @@ impl Wire for ControlMessage {
                 t::CONV_REJECT
             }
             Self::GlobalRequest {
-                name,
                 want_reply,
-                body,
+                request,
             } => {
-                put_string(b, name)?;
+                put_string(b, request.name())?;
                 put_bool(b, *want_reply);
-                b.extend_from_slice(body);
+                match request {
+                    GlobalRequest::TcpipForward(address)
+                    | GlobalRequest::CancelTcpipForward(address) => address.encode(b)?,
+                    GlobalRequest::Other { body, .. } => b.extend_from_slice(body),
+                }
                 t::GLOBAL_REQUEST
             }
             Self::RequestSuccess { body } => {
@@ -182,11 +249,26 @@ impl ControlMessage {
             t::CONV_REJECT => Self::ConvReject {
                 reason: b.string("reject reason")?,
             },
-            t::GLOBAL_REQUEST => Self::GlobalRequest {
-                name: b.string("global request name")?,
-                want_reply: b.bool()?,
-                body: Bytes::copy_from_slice(b.rest()),
-            },
+            t::GLOBAL_REQUEST => {
+                let name = b.string("global request name")?;
+                let want_reply = b.bool()?;
+                let request = match name.as_str() {
+                    global_request_type::TCPIP_FORWARD => {
+                        GlobalRequest::TcpipForward(ForwardAddress::decode(b)?)
+                    }
+                    global_request_type::CANCEL_TCPIP_FORWARD => {
+                        GlobalRequest::CancelTcpipForward(ForwardAddress::decode(b)?)
+                    }
+                    _ => GlobalRequest::Other {
+                        name,
+                        body: Bytes::copy_from_slice(b.rest()),
+                    },
+                };
+                Self::GlobalRequest {
+                    want_reply,
+                    request,
+                }
+            }
             t::REQUEST_SUCCESS => Self::RequestSuccess {
                 body: Bytes::copy_from_slice(b.rest()),
             },
