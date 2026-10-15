@@ -34,12 +34,13 @@ pub mod open_failure {
     pub const RESOURCE_SHORTAGE: u64 = 4;
 }
 
-/// One message on a channel stream.
+/// One message on an SSH channel.
 ///
-/// A Rust `enum` is a tagged union, like `std::variant` but with named
-/// alternatives, and `match` on it must handle every alternative. Adding a
-/// variant therefore makes the compiler point at every place that needs
-/// updating.
+/// This type only includes messages that are sent on their dedicated SSH channels
+/// (§5, RFC 4254; mapped to QUIC bi-directional streams in draft-michel-remote-terminal-http3).
+/// 
+/// Global requests in SSH, and control messages used privately by Shion, are not
+/// included inside this type.  Those are in [`crate::control::ControlMessage`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     OpenConfirmation {
