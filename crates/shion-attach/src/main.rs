@@ -374,7 +374,9 @@ async fn relay(channel: Channel, track_window: bool) -> io::Result<Option<Channe
             // lost, and the next call picks up where this one left off.
             n = stdin.read(&mut buf), if stdin_open => match n {
                 Ok(0) | Err(_) => {
-                    // FIN on our side, the equivalent of SSH's CHANNEL_EOF.
+                    // This sends FIN on our side, i.e. the connection becomes half-closed.
+                    // In SSH3, there's no SSH_MSG_CHANNEL_EOF message: EOF is implied
+                    // by the QUIC stream's half-closing.  async-smux does the same.
                     stdin_open = false;
                     sink.close().await?;
                 }

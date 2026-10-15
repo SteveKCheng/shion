@@ -400,8 +400,12 @@ async fn supervise(
             status = &mut finished => return Ok(status?),
             msg = incoming.next(), if !peer_eof => match msg {
                 None => {
-                    // Peer's FIN = SSH's CHANNEL_EOF. Dropping the sender
-                    // ends the stdin pump, which closes the child's stdin.
+                    // Peer's FIN, i.e. the connection being half-closed from the peer's side,
+                    // implied EOF in SSH3.  SSH3 assumes a transport that supports half-close,
+                    // in particular QUIC, but async-smux does support this requirement.
+                    // There is no SSH_MSG_CHANNEL_EOF message as in SSH2.  Dropping the sender
+                    // causes the pump_input task to see the end of the queue, which in turn
+                    // causes it to drop its stdin.
                     peer_eof = true;
                     input = None;
                 }
@@ -445,6 +449,15 @@ async fn supervise(
 /// into the child process.
 ///
 /// Copying stops when `rx` is closed, or writing to the child fails.
+///
+/// `stdin` is dropped at the end of the copying by this function. If it is 
+/// a pipe, that closes our end of the pipe and the child process reads EOF. 
+///
+/// On the other hand, if `stdin` is a pty slave, dropping it does not
+/// cause the child process to get EOF.  The pty master stays open,
+/// so the child simply gets no more input, as with OpenSSH.  Note
+/// that a command like `ssh -tt ‹host› cat < /dev/null` does hang,
+/// while `ssh ‹host› cat < /dev/null` does not.
 async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: impl AsyncWrite + Unpin) {
     while let Some(data) = rx.recv().await {
         if let Err(e) = stdin.write_all(&data).await {
@@ -452,9 +465,6 @@ async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: impl AsyncWrite + 
             return;
         }
     }
-    // `stdin` is dropped here. For a pipe, that closes it and the child
-    // reads EOF. A pty master stays open through the reading half, so the
-    // child simply gets no more input, as with OpenSSH.
 }
 
 /// Continually copies the child's stdout or stderr to put into the
