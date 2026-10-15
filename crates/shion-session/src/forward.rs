@@ -24,7 +24,7 @@ use shion_wire::{ChannelHeader, ChannelKind, CodecError, Message};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
@@ -111,7 +111,24 @@ pub async fn direct(
 /// listening; connections already being forwarded carry on.
 #[derive(Debug)]
 pub struct Listener {
-    tasks: Vec<AbortHandle>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl Listener {
+    /// Stops listening, and returns once the sockets are closed.
+    ///
+    /// Aborting a task only asks the runtime to stop it: the task (and the
+    /// socket it owns) is dropped some time later. Waiting for it means a
+    /// client told "cancelled" can count on it.
+    pub async fn close(mut self) {
+        // `take` leaves an empty `Vec`, so `drop` has nothing left to do.
+        for task in std::mem::take(&mut self.tasks) {
+            task.abort();
+            // An aborted task's result is a "cancelled" error; it only
+            // matters that it has finished.
+            let _ = task.await;
+        }
+    }
 }
 
 impl Drop for Listener {
@@ -178,7 +195,7 @@ pub async fn listen(
                 Arc::clone(conversation),
                 connector.clone(),
             );
-            tokio::spawn(task).abort_handle()
+            tokio::spawn(task)
         })
         .collect();
     Ok((port, Listener { tasks }))

@@ -1,6 +1,6 @@
 # shion — design, part 1: the session process
 
-Status: decisions of 2026-10-14 incorporated (see §8); M0–M4 done
+Status: decisions of 2026-10-14 incorporated (see §8); M0–M5 done; the front-end is described in `design-front.md`
 
 ## 1. Goals and non-goals
 
@@ -381,6 +381,9 @@ Ordering rules from RFC 4254 that we have to keep:
      and `SSH_TTY`.
 
   cwd = home.
+- Signals that we may have been started with ignored (SIGHUP, SIGINT,
+  SIGQUIT, SIGTERM and the job-control ones) are reset to their defaults
+  at startup, since ignored signals stay ignored across `exec`.
 - Every child gets its own process group: `process_group(0)` for pipes,
   `setsid()` for a pty (§5.4). `signal` requests and conversation teardown
   target the group; with a pty, `signal` targets the terminal's *foreground*
@@ -506,8 +509,10 @@ carrier. Processes that outlived their conversation (`nohup`, daemons) live
 until then; with bwrap, the session process exiting tears the sandbox down.
 A front-end that opens a conversation just as the session gives up sees the
 carrier close and must start a new session process, as after a crash.
-The front-end knows when it opens conversations, so it could implement
-lingering without that race; `--linger` may move there (undecided).
+The front-end knows when it opens conversations, so it can linger without
+that race, and since M5 it does (`linger` in its configuration;
+`design-front.md` §4). `--linger` remains for other front-ends, such as
+`shion-attach`.
 
 Everything on this command line is visible inside the sandbox
 (`/proc/<pid>/cmdline`), which is fine because the session process holds no
@@ -533,7 +538,7 @@ shion/
 │   │                          one command, a subsystem (`-s`), and port
 │   │                          forwarding (`-L`, `-R`, `-N`), so you can test
 │   │                          M1–M4 before any SSH front-end exists
-│   └── shion-front/           russh front-end (later)
+│   └── shion-front/           russh front-end (`design-front.md`)
 ├── docs/
 └── notes/
 ```
@@ -556,7 +561,7 @@ Main dependencies: `tokio`, `tokio-util`, `bytes`, `async-smux`, `rustix`,
 | M2 | pty, `shell`, `window-change`, `signal`, terminal modes; `shion-attach` (done) | interactive `bash`, `vim`, resize, `^C`          |
 | M3 | subsystems (sftp), env allowlist, conversation teardown, `--linger` (done)   | `sftp -D` via shion-attach; teardown tests       |
 | M4 | `direct-tcpip`, `tcpip-forward` / `forwarded-tcpip` (done)                   | protocol tests; `curl` via `shion-attach -L/-R`  |
-| M5 | `shion-front`: russh, user DB, bwrap policy, SSH2⇄SSH3 translation           | real `ssh`, `sftp`, `ssh -L/-R` against it       |
+| M5 | `shion-front`: russh, user DB, bwrap policy, SSH2⇄SSH3 translation (done)    | real `ssh`, `sftp`, `ssh -L/-R` against it       |
 
 ## 8. Decisions (2026-10-14)
 

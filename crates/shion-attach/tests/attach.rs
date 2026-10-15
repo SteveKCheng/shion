@@ -136,13 +136,18 @@ fn sftp_subsystem() {
     );
 }
 
-/// A port that was free a moment ago.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A port for test number `n` to listen on.
+///
+/// Not "a port that was free a moment ago" (bind to port 0, read it, close
+/// it): such ports come from the kernel's ephemeral range, which every
+/// other `bind(0)` and outgoing connection in the parallel tests draws from
+/// too, and a collision sent this test's connection to another test's
+/// listener about once in 40 runs. Ports below that range (which starts at
+/// 32768) are never handed out by the kernel; basing them on our process ID
+/// keeps concurrent test runs apart.
+fn test_port(n: u16) -> u16 {
+    let base = u16::try_from(std::process::id() % 1000).unwrap();
+    20_000 + base * 10 + n
 }
 
 /// A TCP server that reads one line, answers `hello <line>` and closes.
@@ -166,7 +171,7 @@ fn greeter() -> u16 {
 fn local_forwarding() {
     use std::io::Read;
     let target = greeter();
-    let port = free_port();
+    let port = test_port(1);
     let home = tempfile::tempdir().unwrap();
     let mut attach = Command::new(env!("CARGO_BIN_EXE_shion-attach"))
         .args(["-N", "-L", &format!("{port}:localhost:{target}")])
@@ -198,7 +203,7 @@ fn local_forwarding() {
 #[test]
 fn remote_forwarding() {
     let target = greeter();
-    let port = free_port();
+    let port = test_port(2);
     // bash's /dev/tcp makes a TCP client inside the session.
     let output = attach(
         &[
@@ -223,4 +228,20 @@ fn forwarding_specs_are_checked() {
         let output = attach(&["-N", "-L", spec], b"");
         assert_eq!(output.status.code(), Some(2), "{spec}: {output:?}");
     }
+}
+
+#[test]
+fn children_get_default_signal_actions() {
+    // Start the session process with signals ignored, as `cmd &` in a
+    // script or `nohup` would. Its children must not inherit that.
+    let session =
+        std::path::Path::new(env!("CARGO_BIN_EXE_shion-attach")).with_file_name("shion-session");
+    let home = tempfile::tempdir().unwrap();
+    let line = format!(
+        "trap '' INT QUIT HUP; exec {} --user tester --home {}",
+        session.display(),
+        home.path().display()
+    );
+    let output = attach(&["-S", &line, "grep SigIgn /proc/self/status"], b"");
+    assert_eq!(output.stdout, b"SigIgn:\t0000000000000000\n", "{output:?}");
 }

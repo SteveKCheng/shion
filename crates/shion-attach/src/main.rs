@@ -137,6 +137,16 @@ async fn run(args: Args) -> io::Result<u8> {
     // The control stream must stay open for the whole conversation.
     let mut control = open_conversation(&connector, &args.user).await?;
 
+    // For `-N`, listen for ^C and SIGTERM before anything else starts:
+    // tokio only reports signals that arrive once the listener exists. (A
+    // test that connected through `-L` and then sent SIGTERM could
+    // otherwise beat us to it, and we'd wait forever.)
+    let interrupts = if args.no_command {
+        Some(Interrupts::listen()?)
+    } else {
+        None
+    };
+
     // Port forwarding runs in tasks of its own until `stop` is cancelled.
     let stop = CancellationToken::new();
     let mut tasks = Vec::new();
@@ -156,8 +166,8 @@ async fn run(args: Args) -> io::Result<u8> {
         stop.clone(),
     )));
 
-    let code = if args.no_command {
-        wait_for_interrupt(&mut control).await?;
+    let code = if let Some(interrupts) = interrupts {
+        interrupts.wait(&mut control).await;
         0
     } else {
         run_session(&args, &connector).await?
@@ -237,20 +247,32 @@ async fn run_session(args: &Args, connector: &MuxConnector<UnixStream>) -> io::R
     })
 }
 
-/// For `-N`: waits for `^C`, SIGTERM, or the session process going away.
-async fn wait_for_interrupt(control: &mut Framed<Stream, ControlCodec>) -> io::Result<()> {
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
-    tokio::select! {
-        _ = interrupt.recv() => {}
-        _ = terminate.recv() => {}
-        // Nothing arrives on the control stream unasked; its end means the
-        // session process is gone.
-        () = async { while control.next().await.is_some() {} } => {
-            eprintln!("shion-attach: the session ended");
+/// `^C` and SIGTERM, which end `-N`.
+struct Interrupts {
+    interrupt: Signal,
+    terminate: Signal,
+}
+
+impl Interrupts {
+    fn listen() -> io::Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    /// Waits for `^C`, SIGTERM, or the session process going away.
+    async fn wait(mut self, control: &mut Framed<Stream, ControlCodec>) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+            // Nothing arrives on the control stream unasked; its end means
+            // the session process is gone.
+            () = async { while control.next().await.is_some() {} } => {
+                eprintln!("shion-attach: the session ended");
+            }
         }
     }
-    Ok(())
 }
 
 /// Starts the session process with one end of a `socketpair` as its stdin

@@ -112,7 +112,8 @@ async fn global_request(
         GlobalRequest::CancelTcpipForward(request) => {
             // The client names the port that was bound, even if it asked
             // for 0, so the key matches.
-            if listeners.remove(&request).is_some() {
+            if let Some(listener) = listeners.remove(&request) {
+                listener.close().await;
                 info!(
                     conversation = conversation.id(),
                     address = request.address,

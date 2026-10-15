@@ -47,3 +47,33 @@ pub fn kill_group(pgid: Option<Pid>, sig: Signal) -> bool {
         }
     }
 }
+
+/// Restores the default action of the signals we may have been started
+/// with ignored.
+///
+/// An ignored signal stays ignored across `exec`, so every child would
+/// inherit that, and it happens easily: a non-interactive shell starts
+/// background jobs (`shion-front &`) with SIGINT and SIGQUIT ignored, and
+/// `nohup` ignores SIGHUP. Then `^C` wouldn't interrupt anything in a
+/// session, and hanging up a conversation would do nothing. sshd resets
+/// signals for its children too.
+pub fn reset_ignored() {
+    for signal in [
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTERM,
+        libc::SIGTSTP,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+    ] {
+        #[allow(unsafe_code)]
+        // SAFETY: `signal` is unsafe because the handler it installs could
+        // be any function, which then runs at awkward moments. `SIG_DFL`
+        // installs no function at all, and dispositions are process-wide,
+        // so it doesn't matter which thread does this.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+        }
+    }
+}

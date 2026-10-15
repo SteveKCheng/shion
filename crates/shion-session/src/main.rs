@@ -27,10 +27,14 @@ async fn main() -> ExitCode {
     // stdout is the protocol stream, so logs go to stderr.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        // Colours only on a terminal, not in a log file or pipe.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    signals::reset_ignored();
 
     // Defense in depth (design §3): stops same-uid processes in the sandbox
     // from ptrace-ing us or reading our memory. Children get their own
