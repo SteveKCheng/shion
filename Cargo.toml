@@ -36,3 +36,9 @@ missing_debug_implementations = "warn"
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 undocumented_unsafe_blocks = "warn"
+
+# Experiment in making release-mode binaries smaller
+[profile.release]
+lto = true
+strip = true
+opt-level = "z"
