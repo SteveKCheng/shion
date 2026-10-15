@@ -96,6 +96,8 @@ pub async fn run(
 
     let packet_size = packet_size(header.max_packet_size);
 
+    // Multiple tasks generate messages into the MPSC queue.
+    // Continually forward them into the SSH channel.
     let (out, out_rx) = mpsc::channel(32);
     let writer = tokio::spawn(write_messages(sink, out_rx));
 
@@ -121,7 +123,9 @@ pub async fn run(
         let _ = out.send(exit_message(status)).await;
     }
 
-    drop(out); // the last Sender: the writer flushes, sends FIN and exits
+    // "out" is the last Sender.
+    // Dropping it here ensures everything is flushed, and FIN is sent.
+    drop(out);
     writer.await.map_err(io::Error::other)??;
 
     // Wait for the peer's FIN too, so the stream is fully closed before we
@@ -169,7 +173,11 @@ pub fn packet_size(peer_max: u64) -> usize {
     usize::try_from(peer_max.clamp(1, OUR_MAX_PACKET)).unwrap_or(1)
 }
 
-/// Owns the write half: sends everything queued on `rx`, then FIN.
+/// Continually sends dequeues from `rx` and sends its items to the SSH channel referred
+/// to by `sink`.  When the queue reaches EOF, the sink is closed too (FIN).
+///
+/// There are multiple tasks for the SSH ("session") channel that need to write messages
+/// into the channel.  Writes always need to be serialized through an MPSC queue.
 pub async fn write_messages(
     mut sink: Outgoing,
     mut rx: mpsc::Receiver<Message>,
@@ -521,10 +529,10 @@ async fn supervise(
                 None => {
                     // Peer's FIN, i.e. the connection being half-closed from the peer's side,
                     // implied EOF in SSH3.  SSH3 assumes a transport that supports half-close,
-                    // in particular QUIC, but async-smux does support this requirement.
+                    // in particular QUIC, but async-smux does support this requirement too.
                     // There is no SSH_MSG_CHANNEL_EOF message as in SSH2.  Dropping the sender
-                    // causes the pump_input task to see the end of the queue, which in turn
-                    // causes it to drop its stdin.
+                    // causes the pump_input task to see the end of the queue, which, when reached,
+                    // causes it to drop stdin (to the child process).
                     peer_eof = true;
                     input = None;
                 }
@@ -567,7 +575,7 @@ async fn supervise(
 /// `rx` is the queue where the SSH message parser pushes data to pump
 /// into the child process.
 ///
-/// Copying stops when `rx` is closed, or writing to the child fails.
+/// Copying stops when `rx` reaches EOF, or writing to the child fails.
 ///
 /// `stdin` is dropped at the end of the copying by this function. If it is
 /// a pipe, that closes our end of the pipe and the child process reads EOF.
@@ -593,6 +601,11 @@ async fn supervise(
 /// defines its flow control window to exclude "out-of-band" data like window-change
 /// requests;  SSH3 doesn't make the same distinction and neither does Shion,
 /// which makes this implementation slightly less responsive than maximally possible.
+///
+/// Finally, there is an unavoidable race where the child process can exit,
+/// or have its stdin closed by the kernel, when there is still input data on the
+/// way from the client.  This is considered normal and harmless, but will also
+/// naturally make this function stop pumping stdin further.
 async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: impl AsyncWrite + Unpin) {
     while let Some(data) = rx.recv().await {
         if let Err(e) = stdin.write_all(&data).await {
@@ -614,7 +627,7 @@ async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: impl AsyncWrite + 
 /// relevant SSH channel, in chunks of at most `packet_size`.
 ///
 /// Copying stops when the child's stream reaches end-of-file,
-/// or the receiving channel for that output has been closed,
+/// or the receiving queue for that output has been dropped,
 /// or some other error is encountered.
 ///
 /// The payload bytes are wrapped in either a `SSH_MSG_CHANNEL_DATA` or
@@ -708,8 +721,8 @@ async fn pump_terminal(
 /// Queues `data` as `CHANNEL_DATA`, or as `CHANNEL_EXTENDED_DATA` if
 /// `data_type` is given.
 ///
-/// Does nothing, and returns false, if the MPSC queue is no longer available.
-/// Otherwise returns true.
+/// Does nothing, and returns false, if the MPSC queue is no longer available
+/// to write to, i.e. the receiver was dropped.  Otherwise returns true.
 async fn send_output(out: &Out, data_type: Option<u64>, data: &[u8]) -> bool {
     let data = Bytes::copy_from_slice(data);
     let msg = match data_type {
