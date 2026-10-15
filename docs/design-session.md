@@ -530,8 +530,9 @@ shion/
 │   ├── shion-attach/          debug client: spawns shion-session (or any
 │   │                          command line, e.g. under bwrap, with `-S`)
 │   │                          and attaches like `ssh`: an interactive pty or
-│   │                          one command, so you can test M1–M3 before any
-│   │                          SSH front-end exists
+│   │                          one command, a subsystem (`-s`), and port
+│   │                          forwarding (`-L`, `-R`, `-N`), so you can test
+│   │                          M1–M4 before any SSH front-end exists
 │   └── shion-front/           russh front-end (later)
 ├── docs/
 └── notes/
@@ -554,7 +555,7 @@ Main dependencies: `tokio`, `tokio-util`, `bytes`, `async-smux`, `rustix`,
 | M1 | session: carrier, control stream, `exec` over pipes, `exit-status` (done)    | integration test spawns binary, drives smux      |
 | M2 | pty, `shell`, `window-change`, `signal`, terminal modes; `shion-attach` (done) | interactive `bash`, `vim`, resize, `^C`          |
 | M3 | subsystems (sftp), env allowlist, conversation teardown, `--linger` (done)   | `sftp -D` via shion-attach; teardown tests       |
-| M4 | `direct-tcpip`, `tcpip-forward` / `forwarded-tcpip` (done)                   | TCP clients and servers in the tests             |
+| M4 | `direct-tcpip`, `tcpip-forward` / `forwarded-tcpip` (done)                   | protocol tests; `curl` via `shion-attach -L/-R`  |
 | M5 | `shion-front`: russh, user DB, bwrap policy, SSH2⇄SSH3 translation           | real `ssh`, `sftp`, `ssh -L/-R` against it       |
 
 ## 8. Decisions (2026-10-14)

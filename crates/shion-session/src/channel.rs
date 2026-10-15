@@ -142,7 +142,12 @@ pub async fn refuse(
     reason: u64,
     description: String,
 ) -> Result<(), CodecError> {
-    warn!(conversation = header.conversation_id, channel_type = header.kind.name(), %description, "refusing channel");
+    // A failed connection is the client's business, not a problem here.
+    if reason == open_failure::CONNECT_FAILED {
+        debug!(conversation = header.conversation_id, %description, "channel open failed");
+    } else {
+        warn!(conversation = header.conversation_id, channel_type = header.kind.name(), %description, "refusing channel");
+    }
     sink.send(Message::OpenFailure {
         reason,
         description,

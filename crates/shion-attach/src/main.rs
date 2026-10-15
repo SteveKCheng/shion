@@ -10,11 +10,16 @@
 //! shion-attach -t top             # one command with a pty
 //! shion-attach -S 'bwrap … shion-session --user agent --home /home/agent'
 //! sftp -D 'shion-attach -S "shion-session … --subsystem sftp=…" -s sftp'
+//! shion-attach -N -L 8080:localhost:80   # port forwarding only
+//! shion-attach -R 0:localhost:5432 psql …
 //! ```
 //!
 //! It exits with the remote command's exit status, or 255 on errors and
 //! when the command was killed by a signal (as `ssh` does).
 
+mod forward;
+
+use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -37,6 +42,9 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
+
+use crate::forward::Spec;
 
 /// Our maximum packet size, and the size of our read buffer.
 const PACKET_SIZE: usize = 32 * 1024;
@@ -44,8 +52,12 @@ const PACKET_SIZE: usize = 32 * 1024;
 /// Exit code for our own errors and for remote deaths by signal.
 const EXIT_ERROR: u8 = 255;
 
+/// We only ever have one conversation.
+const CONVERSATION_ID: u64 = 1;
+
 /// Runs `shion-session` and attaches to it like `ssh` would to a server.
 #[derive(Debug, Parser)]
+#[expect(clippy::struct_excessive_bools, reason = "they're command-line flags")]
 #[command(version)]
 struct Args {
     /// Request a pseudo-terminal even for a command or a non-terminal stdin.
@@ -58,7 +70,9 @@ struct Args {
 
     /// Shell command line that starts the session process, which will get
     /// a socket as stdin and stdout. Default: the `shion-session` next to
-    /// this program, with `--user` and `--home` from `--user` and `$HOME`.
+    /// this program, with `--user` and `--home` from `--user` and `$HOME`,
+    /// and `--permit-open`/`--permit-listen` for exactly what `-L` and
+    /// `-R` ask for.
     #[arg(short = 'S', long, value_name = "COMMAND")]
     session: Option<String>,
 
@@ -66,6 +80,22 @@ struct Args {
     /// running a command.
     #[arg(short = 's', requires = "command")]
     subsystem: bool,
+
+    /// Listen on local [BIND:]PORT (default BIND: localhost), and forward
+    /// connections to HOST:HOSTPORT as seen from the session (repeatable).
+    #[arg(short = 'L', value_name = "[BIND:]PORT:HOST:HOSTPORT", value_parser = Spec::parse)]
+    local: Vec<Spec>,
+
+    /// Have the session listen on [BIND:]PORT (default BIND: localhost;
+    /// PORT 0 picks one), and forward connections to local HOST:HOSTPORT
+    /// (repeatable).
+    #[arg(short = 'R', value_name = "[BIND:]PORT:HOST:HOSTPORT", value_parser = Spec::parse)]
+    remote: Vec<Spec>,
+
+    /// Don't start a shell or command: just forward ports, until
+    /// interrupted (`^C`, SIGTERM) or the session process exits.
+    #[arg(short = 'N', conflicts_with_all = ["command", "pty", "subsystem"])]
+    no_command: bool,
 
     /// The app-level user name to send in `CONV_OPEN`.
     #[arg(short = 'l', long, env = "USER")]
@@ -106,7 +136,57 @@ async fn run(args: Args) -> io::Result<u8> {
 
     // The control stream must stay open for the whole conversation.
     let mut control = open_conversation(&connector, &args.user).await?;
-    let mut channel = open_session(&connector).await?;
+
+    // Port forwarding runs in tasks of its own until `stop` is cancelled.
+    let stop = CancellationToken::new();
+    let mut tasks = Vec::new();
+    for spec in &args.local {
+        match forward::listen_local(spec, &connector, &stop).await {
+            Ok(listeners) => tasks.extend(listeners),
+            Err(e) => eprintln!("shion-attach: cannot listen for -L: {e}"),
+        }
+    }
+    let mut targets = HashMap::new();
+    for spec in &args.remote {
+        forward::request_remote(&mut control, spec, &mut targets).await?;
+    }
+    tasks.push(tokio::spawn(forward::accept_remote(
+        acceptor,
+        targets,
+        stop.clone(),
+    )));
+
+    let code = if args.no_command {
+        wait_for_interrupt(&mut control).await?;
+        0
+    } else {
+        run_session(&args, &connector).await?
+    };
+
+    stop.cancel();
+    for task in tasks {
+        let _ = task.await;
+    }
+
+    // Closing the control stream (FIN) ends the conversation; the session
+    // answers with its own FIN. Once every smux handle is gone the worker
+    // closes our socket, and the session process sees EOF and exits.
+    // Holding on to any of them would leave us waiting for the session
+    // while it waits for us.
+    control.close().await?;
+    while control.next().await.is_some() {}
+    drop(control);
+    drop(connector);
+    let _ = worker.await;
+    let _ = child.wait().await;
+
+    Ok(code)
+}
+
+/// Opens a `session` channel, runs the shell or command in it, and returns
+/// the exit code to exit with.
+async fn run_session(args: &Args, connector: &MuxConnector<UnixStream>) -> io::Result<u8> {
+    let mut channel = open_session(connector).await?;
 
     let stdin_is_tty = io::stdin().is_terminal();
     let want_pty = args.pty || (!args.no_pty && args.command.is_empty() && stdin_is_tty);
@@ -139,19 +219,6 @@ async fn run(args: Args) -> io::Result<u8> {
     let exit = relay(channel, raw_mode.is_some()).await?;
     drop(raw_mode); // restore the terminal before printing anything
 
-    // Closing the control stream (FIN) ends the conversation; the session
-    // answers with its own FIN. Once every smux handle is gone the worker
-    // closes our socket, and the session process sees EOF and exits.
-    // Holding on to any of them would leave us waiting for the session
-    // while it waits for us.
-    control.close().await?;
-    while control.next().await.is_some() {}
-    drop(control);
-    drop(connector);
-    drop(acceptor);
-    let _ = worker.await;
-    let _ = child.wait().await;
-
     Ok(match exit {
         Some(ChannelRequest::ExitStatus { status }) => u8::try_from(status).unwrap_or(EXIT_ERROR),
         Some(ChannelRequest::ExitSignal(ExitSignal {
@@ -170,6 +237,22 @@ async fn run(args: Args) -> io::Result<u8> {
     })
 }
 
+/// For `-N`: waits for `^C`, SIGTERM, or the session process going away.
+async fn wait_for_interrupt(control: &mut Framed<Stream, ControlCodec>) -> io::Result<()> {
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = interrupt.recv() => {}
+        _ = terminate.recv() => {}
+        // Nothing arrives on the control stream unasked; its end means the
+        // session process is gone.
+        () = async { while control.next().await.is_some() {} } => {
+            eprintln!("shion-attach: the session ended");
+        }
+    }
+    Ok(())
+}
+
 /// Starts the session process with one end of a `socketpair` as its stdin
 /// and stdout, as the front-end is expected to.
 fn start_session(args: &Args) -> io::Result<(Child, UnixStream)> {
@@ -182,6 +265,13 @@ fn start_session(args: &Args) -> io::Result<(Child, UnixStream)> {
         let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
         let mut cmd = Command::new(exe);
         cmd.arg("--user").arg(&args.user).arg("--home").arg(home);
+        // Exactly what was asked for, and nothing more.
+        for spec in &args.local {
+            cmd.arg("--permit-open").arg(spec.permit_open());
+        }
+        for spec in &args.remote {
+            cmd.arg("--permit-listen").arg(spec.permit_listen());
+        }
         cmd
     };
     // The session logs to our stderr. Keep it quiet unless asked: in raw
@@ -221,7 +311,7 @@ async fn open_conversation(
 ) -> io::Result<Framed<Stream, ControlCodec>> {
     let open = ConvOpen {
         version: PROTOCOL_VERSION,
-        conversation_id: 1,
+        conversation_id: CONVERSATION_ID,
         attributes: vec![
             (attr::USER.into(), user.into()),
             (
@@ -248,7 +338,7 @@ async fn open_conversation(
 /// Opens a `session` channel.
 async fn open_session(connector: &MuxConnector<UnixStream>) -> io::Result<Channel> {
     let header = ChannelHeader {
-        conversation_id: 1,
+        conversation_id: CONVERSATION_ID,
         kind: ChannelKind::Session,
         max_packet_size: PACKET_SIZE as u64,
     };
