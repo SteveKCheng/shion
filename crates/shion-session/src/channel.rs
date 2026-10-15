@@ -111,6 +111,12 @@ pub async fn run(
             packet_size,
         )
         .await?;
+
+        // RFC 4254 requires `exit-status` to come after all outputs,
+        // and of course before the channel closes.  The internal tasks
+        // that the `supervise` function spawns are guaranteed to stop 
+        // pumping messages into the MPSC queue once we have reached this point.
+        // So `exit_message` appears last in the queue.
         info!(conversation = header.conversation_id, %status, "session ended");
         let _ = out.send(exit_message(status)).await;
     }
@@ -188,7 +194,9 @@ pub async fn reply(out: &Out, want_reply: bool, ok: bool) {
     }
 }
 
-/// Handles requests until `shell`, `exec` or `subsystem` starts a child.
+/// Dispatches requests for a SSH "session" channel, until `shell`, `exec` or `subsystem` 
+/// starts a child process.
+/// 
 /// Returns `None` if the peer closes the channel first.
 async fn setup(
     incoming: &mut Incoming,
@@ -426,7 +434,7 @@ async fn supervise(
     let mut input = Some(input); // for dropping `input` early
 
     // Tells the terminal pump that the child has exited.
-    let (exited, child_exited) = oneshot::channel();
+    let (child_exited_trigger, child_exited) = oneshot::channel();
 
     let output = match &terminal {
         None => {
@@ -462,17 +470,42 @@ async fn supervise(
     };
 
     // Future that completes when the child exits (normally or terminated
-    // by a signal) and its output has been relayed.
+    // by a signal) *and* its *output* has been relayed.  Completion of this future
+    // causes the dispatch loop towards the end of the function to stop.
     //
-    // With pipes, that means waiting for EOF, even if a descendant process
-    // that inherited the pipes keeps them open. OpenSSH does the same,
-    // which can be observed by running `ssh host 'sleep 60 &'`: it will
-    // hang for a full minute. With a terminal, see `pump_terminal`.
+    //  - With pipes, `pump_output` stops when it hits EOF.  And that can
+    //    only happen when every copy of the writer end of the pipe —
+    //    initially passed to the child process, which may be duplicated,
+    //    or inherited into descendant processes — is closed.
+    //
+    //    This behavior can be observed in the OpenSSH server by running 
+    //    `ssh ‹host› 'sleep 60 &'`: this command will hang for a full minute, 
+    //    despite the shell process exiting immediately after putting `sleep` 
+    //    into the background, because `sleep` is holding its inherited stdout 
+    //    and stderr open.
+    //
+    //  - With terminals, reading the master pty fails with EIO once every FD
+    //    for the slave is closed.  But, as with non-pty operation, there
+    //    can be background processes holding the slave open.  The policy we
+    //    adopt in Shion is to stop all pumping after the short duration specified
+    //    by TERMINAL_LINGER.  This timeout behavior in `pump_terminal` is triggered
+    //    by signaling `exited`.  
+    //
+    //    OpenSSH, on the other hand, immediately stops pumping after the
+    //    main process exits.  Our TERMINAL_LINGER gives a chance for any
+    //    output remaining in intermediate buffers to drain, to try to avoid 
+    //    losing output if a background process generates some output and then
+    //    the foreground process (such as an interactive shell) immediately exits.
     let finished = async move {
         let status = child.wait().await;
+
+        // Tell pump_terminal to stop pumping as soon as possible.
         // Fails only if the receiver is gone, i.e. there's no terminal.
-        let _ = exited.send(());
+        let _ = child_exited_trigger.send(());
+
+        // Wait for the pumps to stop, before the outer function exits.
         let _ = output.await;
+
         status
     };
 
@@ -665,7 +698,10 @@ async fn pump_terminal(
 }
 
 /// Queues `data` as `CHANNEL_DATA`, or as `CHANNEL_EXTENDED_DATA` if
-/// `data_type` is given. Returns false if the writer is gone.
+/// `data_type` is given. 
+/// 
+/// Does nothing, and returns false, if the MPSC queue is no longer available.
+/// Otherwise returns true.
 async fn send_output(out: &Out, data_type: Option<u64>, data: &[u8]) -> bool {
     let data = Bytes::copy_from_slice(data);
     let msg = match data_type {
