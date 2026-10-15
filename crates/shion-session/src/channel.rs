@@ -544,6 +544,22 @@ async fn supervise(
 /// so the child simply gets no more input, as with OpenSSH.  Note
 /// that a command like `ssh -tt ‹host› cat < /dev/null` does hang,
 /// while `ssh ‹host› cat < /dev/null` does not.
+/// 
+/// Pumping stdin needs to read from an MPSC queue and not directly from the
+/// SSH channel is necessary to avoid head-of-line blocking when the child 
+/// process stops reading stdin.   Otherwise, `write_all(…).await` would 
+/// asynchronously wait, but further messages from the client on the same
+/// SSH channel that are unrelated to the stdin pump, 
+/// such as window-change requests, would become stuck and unable to be
+/// processed.
+/// 
+/// That said, the MPSC queue is expected to be bounded, to avoid consuming
+/// potentially unbounded amounts of memory.  There needs to be flow control
+/// on the SSH channel to tell the client to stop sending more data for stdin
+/// that the MPSC queue can no longer hold.  Note that the SSH2 protocol specifically 
+/// defines its flow control window to exclude "out-of-band" data like window-change 
+/// requests;  SSH3 doesn't make the same distinction and neither does Shion, 
+/// which makes this implementation slightly less responsive than maximally possible.
 async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: impl AsyncWrite + Unpin) {
     while let Some(data) = rx.recv().await {
         if let Err(e) = stdin.write_all(&data).await {
@@ -565,7 +581,15 @@ async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: impl AsyncWrite + 
 /// that will be the data type code inside `SSH_MSG_CHANNEL_EXTENDED_DATA`.
 ///
 /// `out` is the MPSC queue where this function will push the output
-/// SSH messages into.
+/// SSH messages into.  
+/// 
+/// Generally, in the contexts where an invocation of this function participates 
+/// in the SSH channel, there are other participants that need to send to the same
+/// channel, e.g. pumping both stdout and stderr, plus sending exit-status messages 
+/// or replies to the client's other requests.  But the sender to the channel
+/// must have a unique owner.  Even without multi-threading, tasks may be 
+/// concurrently executing (some awaiting in the middle).  A MPSC queue effectively 
+/// serializes and orders the messages to accommodate concurrent tasks.
 pub async fn pump_output(
     mut from: impl AsyncRead + Unpin,
     out: Out,

@@ -371,6 +371,16 @@ async fn relay(
         let mut tcp_open = true;
         while let Some(msg) = incoming.next().await {
             match msg? {
+
+                // Pump data from the peer into the TCP connection.
+                //
+                // This part is the only real consumer of the channel once forwarding
+                // begins; as below, all requests are refused.  Practically speaking, 
+                // there will be no head-of-line blocking even without using a MPSC queue
+                // to temporarily buffer data, if writing to the TCP connection stalls. 
+                //
+                // So no MPSC queue is used here, unlike when we pump stdout/stderr
+                // for child processes in channel.rs.
                 Message::Data(data) => {
                     // After a failed write, keep reading and discarding:
                     // unread data would pile up in the smux buffers, which
