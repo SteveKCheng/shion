@@ -27,7 +27,7 @@ use rustix::termios::{InputModes, OptionalActions, SpecialCodeIndex, Termios};
 use shion_wire::codec::{ControlCodec, MessageCodec, StreamStartCodec};
 use shion_wire::control::{PROTOCOL_VERSION, attr};
 use shion_wire::header::channel_type;
-use shion_wire::message::{ExitSignal, PtyRequest, WindowSize};
+use shion_wire::message::{ExitSignal, PtyRequest, WindowSize, EXTENDED_DATA_STDERR};
 use shion_wire::modes::{self, DISABLED_CHAR, opcode};
 use shion_wire::{ChannelHeader, ChannelRequest, ControlMessage, ConvOpen, Message, StreamStart};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -392,7 +392,7 @@ async fn relay(channel: Channel, track_window: bool) -> io::Result<Option<Channe
                     stdout.write_all(&data).await?;
                     stdout.flush().await?;
                 }
-                Some(Message::ExtendedData { data, .. }) => {
+                Some(Message::ExtendedData { data, data_type: EXTENDED_DATA_STDERR }) => {
                     stderr.write_all(&data).await?;
                     stderr.flush().await?;
                 }
