@@ -9,6 +9,7 @@
 //! shion-attach ls -l              # one command, no pty
 //! shion-attach -t top             # one command with a pty
 //! shion-attach -S 'bwrap … shion-session --user agent --home /home/agent'
+//! sftp -D 'shion-attach -S "shion-session … --subsystem sftp=…" -s sftp'
 //! ```
 //!
 //! It exits with the remote command's exit status, or 255 on errors and
@@ -27,7 +28,7 @@ use rustix::termios::{InputModes, OptionalActions, SpecialCodeIndex, Termios};
 use shion_wire::codec::{ControlCodec, MessageCodec, StreamStartCodec};
 use shion_wire::control::{PROTOCOL_VERSION, attr};
 use shion_wire::header::channel_type;
-use shion_wire::message::{ExitSignal, PtyRequest, WindowSize, EXTENDED_DATA_STDERR};
+use shion_wire::message::{EXTENDED_DATA_STDERR, ExitSignal, PtyRequest, WindowSize};
 use shion_wire::modes::{self, DISABLED_CHAR, opcode};
 use shion_wire::{ChannelHeader, ChannelRequest, ControlMessage, ConvOpen, Message, StreamStart};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -59,6 +60,11 @@ struct Args {
     /// this program, with `--user` and `--home` from `--user` and `$HOME`.
     #[arg(short = 'S', long, value_name = "COMMAND")]
     session: Option<String>,
+
+    /// Start the subsystem named by the command (e.g. `sftp`) instead of
+    /// running a command.
+    #[arg(short = 's', requires = "command")]
+    subsystem: bool,
 
     /// The app-level user name to send in `CONV_OPEN`.
     #[arg(short = 'l', long, env = "USER")]
@@ -116,6 +122,10 @@ async fn run(args: Args) -> io::Result<u8> {
 
     let start = if args.command.is_empty() {
         ChannelRequest::Shell
+    } else if args.subsystem {
+        ChannelRequest::Subsystem {
+            name: args.command.join(" "),
+        }
     } else {
         ChannelRequest::Exec {
             command: Bytes::from(args.command.join(" ")),

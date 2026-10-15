@@ -48,7 +48,7 @@ use crate::pty::Terminal;
 use crate::server::Stream;
 use crate::settings::Settings;
 use crate::signals;
-use crate::state::ServerState;
+use crate::state::{Conversation, ServerState};
 
 /// Largest data payload we accept per message, announced in our
 /// `CHANNEL_OPEN_CONFIRMATION`.
@@ -102,9 +102,17 @@ pub async fn run(
     let writer = tokio::spawn(write_messages(sink, out_rx));
 
     if let Some((child, terminal)) =
-        setup(&mut incoming, &out, &state.settings, &conversation).await?
+        setup(&mut incoming, &out, &state.settings, &conversation.open).await?
     {
-        let status = supervise(child, terminal, &mut incoming, &out, packet_size).await?;
+        let status = supervise(
+            child,
+            terminal,
+            &conversation,
+            &mut incoming,
+            &out,
+            packet_size,
+        )
+        .await?;
         info!(conversation = header.conversation_id, %status, "session ended");
         let _ = out.send(exit_message(status)).await;
     }
@@ -120,7 +128,10 @@ pub async fn run(
 
 /// Decides whether to accept the channel. On refusal, returns the reason
 /// code and description for `CHANNEL_OPEN_FAILURE`.
-fn check_open(header: &ChannelHeader, state: &ServerState) -> Result<Arc<ConvOpen>, (u64, String)> {
+fn check_open(
+    header: &ChannelHeader,
+    state: &ServerState,
+) -> Result<Arc<Conversation>, (u64, String)> {
     if header.channel_type != channel_type::SESSION {
         return Err((
             open_failure::UNKNOWN_CHANNEL_TYPE,
@@ -160,8 +171,8 @@ async fn reply(out: &Out, want_reply: bool, ok: bool) {
     }
 }
 
-/// Handles requests until `shell` or `exec` starts a child. Returns `None`
-/// if the peer closes the channel first.
+/// Handles requests until `shell`, `exec` or `subsystem` starts a child.
+/// Returns `None` if the peer closes the channel first.
 async fn setup(
     incoming: &mut Incoming,
     out: &Out,
@@ -171,6 +182,8 @@ async fn setup(
     // Allocated by `pty-req`, as OpenSSH does, so that failure is reported
     // in reply to that request rather than to `shell`.
     let mut terminal = None;
+    // Variables from accepted `env` requests.
+    let mut client_env = Vec::new();
 
     while let Some(msg) = incoming.next().await {
         match msg? {
@@ -181,6 +194,23 @@ async fn setup(
                 let command = match request {
                     ChannelRequest::Shell => None,
                     ChannelRequest::Exec { command } => Some(command),
+                    ChannelRequest::Subsystem { name } => {
+                        // Like OpenSSH, run the subsystem's command with
+                        // the shell, as if the client had sent `exec`.
+                        if let Some(command) = settings.subsystem(&name) {
+                            debug!(subsystem = name, command, "starting subsystem");
+                            Some(Bytes::copy_from_slice(command.as_bytes()))
+                        } else {
+                            debug!(subsystem = name, "refusing unknown subsystem");
+                            reply(out, want_reply, false).await;
+                            continue;
+                        }
+                    }
+                    ChannelRequest::Env { name, value } => {
+                        let ok = accept_env(settings, &mut client_env, &name, &value);
+                        reply(out, want_reply, ok).await;
+                        continue;
+                    }
                     ChannelRequest::PtyReq(request) => {
                         // One terminal per channel.
                         let ok = terminal.is_none()
@@ -203,7 +233,7 @@ async fn setup(
                         reply(out, want_reply, ok).await;
                         continue;
                     }
-                    // env and subsystem (M3), x11-req (never).
+                    // x11-req, and requests that only make sense later.
                     other => {
                         debug!(request = other.type_name(), "refusing request");
                         reply(out, want_reply, false).await;
@@ -215,6 +245,7 @@ async fn setup(
                     conversation,
                     command.as_deref(),
                     terminal.as_ref(),
+                    &client_env,
                 ) {
                     Ok(child) => {
                         if let Some(t) = &mut terminal {
@@ -250,16 +281,19 @@ async fn setup(
 ///
 /// `stdin`, `stdout`, and `stderr` for the child process are pipes, or the
 /// `terminal`'s slave if there is one.
+///
+/// `client_env` holds the variables from accepted `env` requests.
 fn spawn(
     settings: &Settings,
     conversation: &ConvOpen,
     command: Option<&[u8]>,
     terminal: Option<&Terminal>,
+    client_env: &[(OsString, OsString)],
 ) -> io::Result<Child> {
     let shell = &settings.shell;
     let mut prog = Command::new(shell);
 
-    // Set the program to execute. 
+    // Set the program to execute.
     if let Some(command) = command {
         // Unix command lines are bytes, not necessarily UTF-8.
         prog.arg("-c").arg(OsStr::from_bytes(command));
@@ -278,7 +312,12 @@ fn spawn(
         .env("SHELL", &settings.shell)
         .env("PATH", DEFAULT_PATH);
 
-    // SSH-specific environment variables
+    // Overrides and additions from `--setenv`, then from the client. The
+    // client can only set what `--accept-env` allows.
+    prog.envs(settings.env.iter().map(|(name, value)| (name, value)));
+    prog.envs(client_env.iter().map(|(name, value)| (name, value)));
+
+    // Facts about this connection come last, so neither can fake them.
     if let (Some(client), Some(server)) = (
         conversation.attribute(attr::CLIENT_ADDRESS),
         conversation.attribute(attr::SERVER_ADDRESS),
@@ -290,16 +329,12 @@ fn spawn(
         }
     }
 
-    // Terminal-specific environment variables
     if let Some(terminal) = terminal {
         if !terminal.term().is_empty() {
             prog.env("TERM", terminal.term());
         }
         prog.env("SSH_TTY", terminal.path());
     }
-
-    // Apply user-supplied overrides/additions to environment variables
-    prog.envs(settings.env.iter().map(|(name, value)| (name, value)));
 
     prog.current_dir(&settings.home);
 
@@ -321,10 +356,40 @@ fn spawn(
     Ok(child)
 }
 
+/// Most variables a client may set with `env` per channel, as in OpenSSH.
+const MAX_CLIENT_ENV: usize = 128;
+
+/// Handles an `env` request: records the variable in `client_env` if
+/// `--accept-env` allows it. Returns whether it was accepted.
+fn accept_env(
+    settings: &Settings,
+    client_env: &mut Vec<(OsString, OsString)>,
+    name: &[u8],
+    value: &[u8],
+) -> bool {
+    // The environment is a list of NUL-terminated `NAME=VALUE` strings, so
+    // neither part may contain NUL, and the name may not contain `=`.
+    let valid =
+        !name.is_empty() && !name.contains(&b'=') && !name.contains(&0) && !value.contains(&0);
+    let ok = valid && client_env.len() < MAX_CLIENT_ENV && settings.accepts_env(name);
+    let name = OsStr::from_bytes(name);
+    if ok {
+        debug!(?name, "accepting env");
+        client_env.push((name.to_owned(), OsStr::from_bytes(value).to_owned()));
+    } else {
+        debug!(?name, "refusing env");
+    }
+    ok
+}
+
 /// Runs the child to completion while relaying data and requests.
+///
+/// Its process group is tracked by `conversation`, which hangs it up if
+/// the conversation ends first.
 async fn supervise(
     mut child: Child,
     terminal: Option<Terminal>,
+    conversation: &Arc<Conversation>,
     incoming: &mut Incoming,
     out: &Out,
     packet_size: usize,
@@ -335,6 +400,10 @@ async fn supervise(
         .id()
         .and_then(|id| i32::try_from(id).ok())
         .and_then(Pid::from_raw);
+    // Tracked until this function returns, i.e. until the child has exited
+    // and its output has been relayed. (`Option::map` runs `track` only if
+    // there is a group.)
+    let _tracked = pgid.map(|pgid| conversation.track(pgid));
 
     let (input, input_rx) = mpsc::channel(16);
     let mut input = Some(input); // for dropping `input` early
@@ -450,8 +519,8 @@ async fn supervise(
 ///
 /// Copying stops when `rx` is closed, or writing to the child fails.
 ///
-/// `stdin` is dropped at the end of the copying by this function. If it is 
-/// a pipe, that closes our end of the pipe and the child process reads EOF. 
+/// `stdin` is dropped at the end of the copying by this function. If it is
+/// a pipe, that closes our end of the pipe and the child process reads EOF.
 ///
 /// On the other hand, if `stdin` is a pty slave, dropping it does not
 /// cause the child process to get EOF.  The pty master stays open,

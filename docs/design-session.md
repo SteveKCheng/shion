@@ -1,6 +1,6 @@
 # shion — design, part 1: the session process
 
-Status: decisions of 2026-10-14 incorporated (see §8)
+Status: decisions of 2026-10-14 incorporated (see §8); M0–M3 done
 
 ## 1. Goals and non-goals
 
@@ -127,7 +127,7 @@ The mapping from QUIC concepts to smux concepts:
 | client bidi stream          | smux stream opened by front-end (odd IDs) |
 | server bidi stream          | smux stream opened by session (even IDs)  |
 | stream FIN (half-close)     | smux FIN (async-smux supports half-close) |
-| stream reset                | smux FIN both ways + drop                 |
+| stream reset                | **missing in smux v1**, see §4.6          |
 | QUIC per-stream flow control| **missing in smux v1**, see §4.5          |
 | QUIC datagrams (UDP fwd)    | not supported (UDP forwarding deferred)   |
 
@@ -240,8 +240,15 @@ stream the front-end opens. `0xaf3627e6` means a channel header follows;
 192 means it's a control stream starting with CONV_OPEN. Nothing else is
 valid (`shion_wire::StreamStart`).
 
-Closing the control stream (FIN both ways) ends the conversation. The session
-then sends SIGHUP to every process group the conversation started.
+Closing the control stream (or the stream failing) ends the conversation.
+The session then sends SIGHUP to every process group the conversation
+started whose channel is still running, whether or not it has a pty. That's
+stricter than OpenSSH, where only a pty session gets a hangup (from the
+kernel, when the master closes) and a command on pipes runs on until it
+writes to its closed stdout. For agents, leaving nothing running behind the
+user's back seems the better default; `nohup` and `setsid` still opt out.
+A channel that is just starting its child as the conversation ends hangs it
+up right away.
 
 ### 4.4 Who opens what
 
@@ -268,6 +275,21 @@ it. If the session process ever runs remotely, where this would really
 bite, the carrier would become QUIC (which has per-stream flow control)
 rather than a better smux. All channel code goes through
 `AsyncRead`/`AsyncWrite`, so changing the carrier later won't touch it.
+
+### 4.6 Open issue: aborting a channel
+
+SSH2 distinguishes `CHANNEL_EOF` (no more data from me) from
+`CHANNEL_CLOSE` (I'm done with this channel, in both directions). SSH3
+maps them onto QUIC's FIN and stream reset (RESET_STREAM/STOP_SENDING).
+smux v1 has only FIN; even dropping a stream sends one. So when an SSH2
+client sends `CHANNEL_CLOSE` before the session has finished, the
+front-end can only pass on an EOF: a pipe child sees EOF on stdin, while a
+pty child sees nothing at all and keeps running until the conversation
+ends.
+
+Since async-smux will need changes anyway (the flush bug, flow control),
+the likely fix is a RST frame there, as TCP has, rather than a control
+message. Separate from M3; to be decided.
 
 ## 5. Inside the session process
 
@@ -343,12 +365,21 @@ Ordering rules from RFC 4254 that we have to keep:
 
 - `shell` → `<shell> -l` (argv[0] is `-bash`, as login shells expect)
 - `exec cmd` → `<shell> -c cmd`
-- `subsystem name` → the command from `--subsystem` (§5.6) (e.g.
-  `sftp` → `/usr/libexec/openssh/sftp-server`); unknown names → FAILURE.
-- The environment is **built from scratch**, never inherited: `HOME`,
-  `USER`/`LOGNAME` (the app-level name), `SHELL`, `PATH`, `TERM` (if pty),
-  `SSH_CONNECTION`-style info, then accepted `env` requests filtered by the
-  `--accept-env` globs. cwd = home.
+- `subsystem name` → `<shell> -c <command>`, with the command from
+  `--subsystem` (§5.6) (e.g. `sftp` → `/usr/libexec/openssh/sftp-server`),
+  as OpenSSH does; unknown names → FAILURE, and the channel stays usable.
+- The environment is **built from scratch**, never inherited, in this
+  order (later entries win):
+  1. `HOME`, `USER`/`LOGNAME` (the app-level name), `SHELL`, `PATH`;
+  2. `--setenv` variables;
+  3. accepted `env` requests: names matching an `--accept-env` pattern
+     (`*` and `?` wildcards, as OpenSSH's `AcceptEnv`), at most 128, no
+     `=` or NUL; refused by default;
+  4. facts about the connection, which neither the client nor `--setenv`
+     can override: `SSH_CONNECTION`, `SSH_CLIENT`, and with a pty `TERM`
+     and `SSH_TTY`.
+
+  cwd = home.
 - Every child gets its own process group: `process_group(0)` for pipes,
   `setsid()` for a pty (§5.4). `signal` requests and conversation teardown
   target the group; with a pty, `signal` targets the terminal's *foreground*
@@ -426,7 +457,14 @@ bwrap --unshare-all --die-with-parent \
 | `--accept-env GLOB` (rep.)   | which client `env` requests are honored                   |
 | `--subsystem NAME=CMD` (rep.)| subsystem table                                           |
 | `--allow-forwarding …` (M4)  | port-forwarding permissions                               |
-| `--linger SECONDS`           | keep the sandbox alive this long after the last logout    |
+| `--linger SECONDS`           | exit after this long without conversations (see below)    |
+
+`--linger` counts from startup too, and any conversation opening or closing
+restarts it. Without it, the process runs until the front-end closes the
+carrier. Processes that outlived their conversation (`nohup`, daemons) live
+until then; with bwrap, the session process exiting tears the sandbox down.
+A front-end that opens a conversation just as the session gives up sees the
+carrier close and must start a new session process, as after a crash.
 
 Everything on this command line is visible inside the sandbox
 (`/proc/<pid>/cmdline`), which is fine because the session process holds no
@@ -472,7 +510,7 @@ Main dependencies: `tokio`, `tokio-util`, `bytes`, `async-smux`, `rustix`,
 | M0 | Workspace and `shion-wire` codec (done)                                      | unit tests, sshoq vectors                        |
 | M1 | session: carrier, control stream, `exec` over pipes, `exit-status` (done)    | integration test spawns binary, drives smux      |
 | M2 | pty, `shell`, `window-change`, `signal`, terminal modes; `shion-attach` (done) | interactive `bash`, `vim`, resize, `^C`          |
-| M3 | subsystems (sftp), env allowlist, conversation teardown, `PR_SET_DUMPABLE`   | `sftp` via shion-attach; fd-leak test            |
+| M3 | subsystems (sftp), env allowlist, conversation teardown, `--linger` (done)   | `sftp -D` via shion-attach; teardown tests       |
 | M4 | `direct-tcpip`, `tcpip-forward` / `forwarded-tcpip`                          | curl through a forward                           |
 | M5 | `shion-front`: russh, user DB, bwrap policy, SSH2⇄SSH3 translation           | real `ssh`, `sftp`, `ssh -L/-R` against it       |
 

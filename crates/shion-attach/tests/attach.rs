@@ -77,3 +77,61 @@ fn wrong_user_is_rejected() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("rejected the conversation"), "{stderr:?}");
 }
+
+#[test]
+fn sftp_subsystem() {
+    let Some(server) = [
+        "/usr/libexec/openssh/sftp-server",
+        "/usr/lib/openssh/sftp-server",
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).exists()) else {
+        eprintln!("skipped: no sftp-server");
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("remote.txt"), "from the sandbox\n").unwrap();
+    std::fs::write(local.path().join("local.txt"), "to the sandbox\n").unwrap();
+    let batch = local.path().join("batch");
+    std::fs::write(
+        &batch,
+        format!(
+            "get remote.txt {local}/copy.txt\nput {local}/local.txt uploaded.txt\n",
+            local = local.path().display()
+        ),
+    )
+    .unwrap();
+
+    // `sftp -D` runs a command (split into words, with quoting) and speaks
+    // sftp over its stdin/stdout: just what `shion-attach -s sftp` gives.
+    let exe = std::path::Path::new(env!("CARGO_BIN_EXE_shion-attach"));
+    let session = format!(
+        "{} --user tester --home {} --subsystem sftp={server}",
+        exe.with_file_name("shion-session").display(),
+        home.path().display()
+    );
+    let attach = format!("{} -l tester -S '{session}' -s sftp", exe.display());
+    let output = match Command::new("sftp")
+        .arg("-b")
+        .arg(&batch)
+        .arg("-D")
+        .arg(&attach)
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("skipped: cannot run sftp: {e}");
+            return;
+        }
+    };
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(local.path().join("copy.txt")).unwrap(),
+        "from the sandbox\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("uploaded.txt")).unwrap(),
+        "to the sandbox\n"
+    );
+}

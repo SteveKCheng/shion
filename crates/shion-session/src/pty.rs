@@ -30,7 +30,7 @@ use tracing::debug;
 #[derive(Debug)]
 pub struct Terminal {
     /// Master side of the pseudo-terminal.
-    /// 
+    ///
     /// Used for `ioctl`s (window size, foreground process group). The I/O
     /// pumps get their own duplicate from [`Terminal::stream`].
     master: OwnedFd,
@@ -63,7 +63,7 @@ impl Terminal {
         let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
         let master = rustix::pty::openpt(flags)?;
 
-        // Traditional POSIX stipulates calling grantpt to change ownership/permissions on 
+        // Traditional POSIX stipulates calling grantpt to change ownership/permissions on
         // the slave pseudo-terminal device.  This is wholly unnecessary in sandboxes, where
         // the slave device will have the correct ownership/permissions to begin with,
         // and usually be reduced to a no-op.
@@ -203,9 +203,9 @@ enum Mode {
     OutputSpeed,
 }
 
-/// Maps an opcode (§8 of RFC 4254) to its `termios` setting. 
-/// 
-/// Opcodes for settings Linux doesn't have (`VDSUSP`, `VSTATUS`, `VFLUSH`) 
+/// Maps an opcode (§8 of RFC 4254) to its `termios` setting.
+///
+/// Opcodes for settings Linux doesn't have (`VDSUSP`, `VSTATUS`, `VFLUSH`)
 /// map to `None`, like unknown ones.
 fn mode(op: u8) -> Option<Mode> {
     use Mode::{Char, CharSize, Control, Input, InputSpeed, Local, Output, OutputSpeed};
@@ -273,9 +273,9 @@ fn mode(op: u8) -> Option<Mode> {
     })
 }
 
-/// Applies an encoded terminal-modes blob (from the SSH message) to `termios`. 
-/// 
-/// Modes we can't apply are skipped, as OpenSSH does: a client's terminal settings 
+/// Applies an encoded terminal-modes blob (from the SSH message) to `termios`.
+///
+/// Modes we can't apply are skipped, as OpenSSH does: a client's terminal settings
 /// are a preference, not a reason to refuse the pty.
 fn apply_modes(termios: &mut Termios, blob: &[u8]) {
     for (op, arg) in modes::decode(blob) {

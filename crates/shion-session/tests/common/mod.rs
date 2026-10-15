@@ -189,6 +189,16 @@ impl Harness {
         channel
     }
 
+    /// Whether the session process has exited.
+    pub fn has_exited(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_some()
+    }
+
+    /// Waits for the session process to exit by itself.
+    pub async fn wait(&mut self) -> ExitStatus {
+        self.child.wait().await.unwrap()
+    }
+
     /// Closes the carrier, as a front-end exiting would, and waits for the
     /// session process to exit. Drop all `Control`s and `Channel`s first:
     /// the smux worker keeps the carrier open while any stream is alive.
@@ -212,6 +222,23 @@ pub async fn request(channel: &mut Channel, request: ChannelRequest) -> Message 
         .await
         .unwrap();
     channel.next().await.expect("channel closed").unwrap()
+}
+
+/// Sends an `env` request and returns whether it was accepted.
+pub async fn env(channel: &mut Channel, name: &str, value: &str) -> bool {
+    let reply = request(
+        channel,
+        ChannelRequest::Env {
+            name: Bytes::copy_from_slice(name.as_bytes()),
+            value: Bytes::copy_from_slice(value.as_bytes()),
+        },
+    )
+    .await;
+    match reply {
+        Message::Success => true,
+        Message::Failure => false,
+        other => panic!("unexpected reply {other:?}"),
+    }
 }
 
 /// Sends `exec` and asserts that it was accepted.

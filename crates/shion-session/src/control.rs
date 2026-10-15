@@ -15,7 +15,7 @@ use crate::server::Stream;
 use crate::state::ServerState;
 
 /// Runs a conversation from `CONV_OPEN` until the front-end closes the
-/// control stream.
+/// control stream, or the stream fails.
 ///
 /// Each "conversation", i.e. a high-level SSH connection from the end user's point of view,
 /// is associated with exactly one control stream.  This function will register the new
@@ -63,7 +63,8 @@ pub async fn run(
 
     info!(conversation = id, "conversation closed");
     framed.close().await
-    // `_registration` is dropped here, which unregisters the conversation.
+    // `_registration` is dropped here, which ends the conversation: its
+    // process groups get SIGHUP. (Returning early through `?` drops it too.)
 }
 
 /// Creates the `ConvAccept` message that we send back to the front-end process.
