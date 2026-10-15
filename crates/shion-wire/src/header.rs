@@ -46,7 +46,7 @@ pub struct ChannelHeader {
 pub enum ChannelKind {
     /// `session`: a shell, command or subsystem.
     Session,
-    
+
     /// `direct-tcpip` (local forwarding, client-to-server, `ssh -L`): connect to `host` and
     /// `port` of the endpoints.
     DirectTcpip(TcpipEndpoints),
@@ -54,7 +54,7 @@ pub enum ChannelKind {
     /// `forwarded-tcpip` (remote forwarding, server-to-client, `ssh -R`): a connection
     /// arrived at a listener set up by `tcpip-forward`.
     ForwardedTcpip(TcpipEndpoints),
-    
+
     /// Any other channel type.
     Other(String),
 }

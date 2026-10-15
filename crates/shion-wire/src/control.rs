@@ -86,7 +86,7 @@ pub struct ConvAccept {
     pub request_types: Vec<String>,
 }
 
-/// Represents a global SSH request (§4, RFC 4254), or a control message 
+/// Represents a global SSH request (§4, RFC 4254), or a control message
 /// privately used by Shion, sent over its control stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlMessage {

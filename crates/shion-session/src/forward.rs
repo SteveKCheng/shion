@@ -37,7 +37,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Responds to a `direct-tcpip` request on a SSH channel, for
 /// client-to-server port forwarding, a.k.a. "local forwarding".
-/// 
+///
 /// This function makes the desired TCP connection (from this process, which is the server side)
 /// to `target`, and then relays data bi-directionally over the SSH channel.
 pub async fn direct(
@@ -111,13 +111,13 @@ pub async fn direct(
     .await
 }
 
-/// The sockets listening for one `tcpip-forward` request. 
-/// 
+/// The sockets listening for one `tcpip-forward` request.
+///
 /// Dropping it stops listening; connections already being forwarded carry on.
 ///
 /// Although the SSH remote-forwarding request only has one "bind address" string,
-/// it may map to multiple applicable socket protocols, e.g. IPv4 and IPv6.  A 
-/// socket needs to be created for each protocol, and they all listen, so this type 
+/// it may map to multiple applicable socket protocols, e.g. IPv4 and IPv6.  A
+/// socket needs to be created for each protocol, and they all listen, so this type
 /// needs to track all them in a `vec`.
 #[derive(Debug)]
 pub struct Listener {
@@ -151,13 +151,13 @@ impl Drop for Listener {
 
 /// Starts listening on the interface/port indicated by `request`, and forwards
 /// each accepted connection over a `forwarded-tcpip` channel of `conversation`.
-/// 
+///
 /// This function is called to respond to the `tcpip-forward` SSH request, i.e.
 /// for server-to-client port forwarding, a.k.a. remote forwarding.  Note that
 /// `tcpip-forward` is a "global request" that is not sent in a dedicated SSH channel.
 /// A new SSH channel is opened only on each incoming connection to the listening port.
-/// 
-/// Returns the port number being listened to, which the system is to choose, 
+///
+/// Returns the port number being listened to, which the system is to choose,
 /// whenever `request` specifies 0.
 pub async fn listen(
     request: &ForwardAddress,
@@ -165,7 +165,6 @@ pub async fn listen(
     conversation: &Arc<Conversation>,
     connector: &Connector,
 ) -> io::Result<(u16, Listener)> {
-
     // Validate request
     let ForwardAddress { address, port } = request;
     if !state.settings.permits_listen(address, *port) {
@@ -223,9 +222,9 @@ pub async fn listen(
     Ok((port, Listener { tasks }))
 }
 
-/// List out the socket addresses needed to be bound for a string address given 
+/// List out the socket addresses needed to be bound for a string address given
 /// by a `tcpip-forward` SSH request.
-/// 
+///
 /// Follows RFC 4254 §7.1, and OpenSSH, for an address of `*`.
 async fn bind_addresses(address: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     Ok(match address {
@@ -281,10 +280,10 @@ async fn accept_loop(
 
 /// Forwards one connection that arrived at a `tcpip-forward` listener, over
 /// a `forwarded-tcpip` channel that we open.
-/// 
+///
 /// This function is called after accepting the connection on the listening port.
 /// It tells the SSH client of the incoming connection and confirms with the client
-/// whether to take the connection.  If yes, data on the new TCP connection 
+/// whether to take the connection.  If yes, data on the new TCP connection
 /// will be relayed.
 async fn forwarded(
     tcp: TcpStream,
@@ -345,7 +344,7 @@ async fn forwarded(
 ///
 /// Each direction ends on its own, as TCP's do: the channel's FIN becomes a
 /// TCP half-close (`shutdown`), and TCP end-of-file becomes our FIN.
-/// 
+///
 /// This function is used for local forwarding and remote forwarding.
 async fn relay(
     sink: Outgoing,
@@ -371,13 +370,12 @@ async fn relay(
         let mut tcp_open = true;
         while let Some(msg) = incoming.next().await {
             match msg? {
-
                 // Pump data from the peer into the TCP connection.
                 //
                 // This part is the only real consumer of the channel once forwarding
-                // begins; as below, all requests are refused.  Practically speaking, 
+                // begins; as below, all requests are refused.  Practically speaking,
                 // there will be no head-of-line blocking even without using a MPSC queue
-                // to temporarily buffer data, if writing to the TCP connection stalls. 
+                // to temporarily buffer data, if writing to the TCP connection stalls.
                 //
                 // So no MPSC queue is used here, unlike when we pump stdout/stderr
                 // for child processes in channel.rs.

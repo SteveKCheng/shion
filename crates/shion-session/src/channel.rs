@@ -114,7 +114,7 @@ pub async fn run(
 
         // RFC 4254 requires `exit-status` to come after all outputs,
         // and of course before the channel closes.  The internal tasks
-        // that the `supervise` function spawns are guaranteed to stop 
+        // that the `supervise` function spawns are guaranteed to stop
         // pumping messages into the MPSC queue once we have reached this point.
         // So `exit_message` appears last in the queue.
         info!(conversation = header.conversation_id, %status, "session ended");
@@ -194,9 +194,9 @@ pub async fn reply(out: &Out, want_reply: bool, ok: bool) {
     }
 }
 
-/// Dispatches requests for a SSH "session" channel, until `shell`, `exec` or `subsystem` 
+/// Dispatches requests for a SSH "session" channel, until `shell`, `exec` or `subsystem`
 /// starts a child process.
-/// 
+///
 /// Returns `None` if the peer closes the channel first.
 async fn setup(
     incoming: &mut Incoming,
@@ -478,10 +478,10 @@ async fn supervise(
     //    initially passed to the child process, which may be duplicated,
     //    or inherited into descendant processes — is closed.
     //
-    //    This behavior can be observed in the OpenSSH server by running 
-    //    `ssh ‹host› 'sleep 60 &'`: this command will hang for a full minute, 
-    //    despite the shell process exiting immediately after putting `sleep` 
-    //    into the background, because `sleep` is holding its inherited stdout 
+    //    This behavior can be observed in the OpenSSH server by running
+    //    `ssh ‹host› 'sleep 60 &'`: this command will hang for a full minute,
+    //    despite the shell process exiting immediately after putting `sleep`
+    //    into the background, because `sleep` is holding its inherited stdout
     //    and stderr open.
     //
     //  - With terminals, reading the master pty fails with EIO once every FD
@@ -489,11 +489,11 @@ async fn supervise(
     //    can be background processes holding the slave open.  The policy we
     //    adopt in Shion is to stop all pumping after the short duration specified
     //    by TERMINAL_LINGER.  This timeout behavior in `pump_terminal` is triggered
-    //    by signaling `exited`.  
+    //    by signaling `exited`.
     //
     //    OpenSSH, on the other hand, immediately stops pumping after the
     //    main process exits.  Our TERMINAL_LINGER gives a chance for any
-    //    output remaining in intermediate buffers to drain, to try to avoid 
+    //    output remaining in intermediate buffers to drain, to try to avoid
     //    losing output if a background process generates some output and then
     //    the foreground process (such as an interactive shell) immediately exits.
     let finished = async move {
@@ -577,26 +577,34 @@ async fn supervise(
 /// so the child simply gets no more input, as with OpenSSH.  Note
 /// that a command like `ssh -tt ‹host› cat < /dev/null` does hang,
 /// while `ssh ‹host› cat < /dev/null` does not.
-/// 
+///
 /// Pumping stdin needs to read from an MPSC queue and not directly from the
-/// SSH channel is necessary to avoid head-of-line blocking when the child 
-/// process stops reading stdin.   Otherwise, `write_all(…).await` would 
+/// SSH channel is necessary to avoid head-of-line blocking when the child
+/// process stops reading stdin.   Otherwise, `write_all(…).await` would
 /// asynchronously wait, but further messages from the client on the same
-/// SSH channel that are unrelated to the stdin pump, 
+/// SSH channel that are unrelated to the stdin pump,
 /// such as window-change requests, would become stuck and unable to be
 /// processed.
-/// 
+///
 /// That said, the MPSC queue is expected to be bounded, to avoid consuming
 /// potentially unbounded amounts of memory.  There needs to be flow control
 /// on the SSH channel to tell the client to stop sending more data for stdin
-/// that the MPSC queue can no longer hold.  Note that the SSH2 protocol specifically 
-/// defines its flow control window to exclude "out-of-band" data like window-change 
-/// requests;  SSH3 doesn't make the same distinction and neither does Shion, 
+/// that the MPSC queue can no longer hold.  Note that the SSH2 protocol specifically
+/// defines its flow control window to exclude "out-of-band" data like window-change
+/// requests;  SSH3 doesn't make the same distinction and neither does Shion,
 /// which makes this implementation slightly less responsive than maximally possible.
 async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: impl AsyncWrite + Unpin) {
     while let Some(data) = rx.recv().await {
         if let Err(e) = stdin.write_all(&data).await {
-            debug!(error = %e, "child's stdin closed");
+            // EPIPE: the child closed its stdin, or exited, while input was
+            // still on its way. That race is normal and harmless. (A pty
+            // master doesn't fail like this: once the slave is closed,
+            // writes fill its buffer, then wait.) Anything else is a fault.
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                debug!(error = %e, "child's stdin closed");
+            } else {
+                warn!(error = %e, "cannot write to child's stdin");
+            }
             return;
         }
     }
@@ -615,13 +623,13 @@ async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: impl AsyncWrite + 
 ///
 /// `out` is the MPSC queue where this function will push the output
 /// SSH messages into.  
-/// 
-/// Generally, in the contexts where an invocation of this function participates 
+///
+/// Generally, in the contexts where an invocation of this function participates
 /// in the SSH channel, there are other participants that need to send to the same
-/// channel, e.g. pumping both stdout and stderr, plus sending exit-status messages 
+/// channel, e.g. pumping both stdout and stderr, plus sending exit-status messages
 /// or replies to the client's other requests.  But the sender to the channel
-/// must have a unique owner.  Even without multi-threading, tasks may be 
-/// concurrently executing (some awaiting in the middle).  A MPSC queue effectively 
+/// must have a unique owner.  Even without multi-threading, tasks may be
+/// concurrently executing (some awaiting in the middle).  A MPSC queue effectively
 /// serializes and orders the messages to accommodate concurrent tasks.
 pub async fn pump_output(
     mut from: impl AsyncRead + Unpin,
@@ -698,8 +706,8 @@ async fn pump_terminal(
 }
 
 /// Queues `data` as `CHANNEL_DATA`, or as `CHANNEL_EXTENDED_DATA` if
-/// `data_type` is given. 
-/// 
+/// `data_type` is given.
+///
 /// Does nothing, and returns false, if the MPSC queue is no longer available.
 /// Otherwise returns true.
 async fn send_output(out: &Out, data_type: Option<u64>, data: &[u8]) -> bool {
