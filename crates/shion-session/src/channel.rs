@@ -115,10 +115,11 @@ pub async fn run(
         .await?;
 
         // RFC 4254 requires `exit-status` to come after all outputs,
-        // and of course before the channel closes.  The internal tasks
-        // that the `supervise` function spawns are guaranteed to stop
-        // pumping messages into the MPSC queue once we have reached this point.
-        // So `exit_message` appears last in the queue.
+        // (and, of course, before the channel closes).  The internal tasks
+        // that `supervise`, above, spawns are guaranteed to stop
+        // pumping messages into the MPSC queue (pointed to by `out`)
+        // once we have reached this point.  So the result of `exit_message`
+        // always appears last in the queue.
         info!(conversation = header.conversation_id, %status, "session ended");
         let _ = out.send(exit_message(status)).await;
     }
@@ -441,21 +442,24 @@ async fn supervise(
     let (input, input_rx) = mpsc::channel(16);
     let mut input = Some(input); // for dropping `input` early
 
-    // Tells the terminal pump that the child has exited.
+    // This will tell the terminal pump when the child exits.
     let (child_exited_trigger, child_exited) = oneshot::channel();
 
+    // Sets up I/O to the child process, and creates the future so we can later join on
+    // the completion of the output pumping, below.
+    //
+    // On the other hand, the input pumping is detached and does not need to be joined on.
+    // As all input data from the client is moved into into a queue first (`input_rx`
+    // above), input pumping is safely de-coupled from the SSH channel.
     let output = match &terminal {
         None => {
-            // All three were configured as pipes in `spawn`, so `take`
-            // can't fail.
+            // All three were configured as pipes in `spawn`, so `take` can't fail.
             let stdin = child.stdin.take().expect("stdin is piped");
             let stdout = child.stdout.take().expect("stdout is piped");
             let stderr = child.stderr.take().expect("stderr is piped");
+
             tokio::spawn(pump_input(input_rx, stdin));
 
-            // Data for stderr is distinguished from stdout, in the SSH
-            // protocol, by sending it as extended data of type
-            // `EXTENDED_DATA_STDERR`.
             let out = out.clone();
             tokio::spawn(async move {
                 tokio::join!(
@@ -497,7 +501,7 @@ async fn supervise(
     //    can be background processes holding the slave open.  The policy we
     //    adopt in Shion is to stop all pumping after the short duration specified
     //    by TERMINAL_LINGER.  This timeout behavior in `pump_terminal` is triggered
-    //    by signaling `exited`.
+    //    by signaling `child_exited_trigger`.
     //
     //    OpenSSH, on the other hand, immediately stops pumping after the
     //    main process exits.  Our TERMINAL_LINGER gives a chance for any
@@ -520,6 +524,12 @@ async fn supervise(
     // `select!` polls `finished` repeatedly through a reference, so it must
     // stay at a fixed address: `pin!` guarantees that.
     let mut finished = std::pin::pin!(finished);
+
+    // This flag is to make the following loop stop polling `incoming.next()` once
+    // the peer has sent FIN.  Polling again after `None` has been received triggers
+    // undefined behavior, and even if it were to be defined to always return `None`
+    // indefinitely, the arm with `msg = incoming.next()` would then always trigger
+    // (when the other arms do not), causing busy-looping, burning CPU cycles needlessly.
     let mut peer_eof = false;
 
     loop {
@@ -527,13 +537,14 @@ async fn supervise(
             status = &mut finished => return Ok(status?),
             msg = incoming.next(), if !peer_eof => match msg {
                 None => {
+                    peer_eof = true;
+
                     // Peer's FIN, i.e. the connection being half-closed from the peer's side,
                     // implied EOF in SSH3.  SSH3 assumes a transport that supports half-close,
                     // in particular QUIC, but async-smux does support this requirement too.
                     // There is no SSH_MSG_CHANNEL_EOF message as in SSH2.  Dropping the sender
                     // causes the pump_input task to see the end of the queue, which, when reached,
-                    // causes it to drop stdin (to the child process).
-                    peer_eof = true;
+                    // causes it to drop stdin; the child process then sees EOF.
                     input = None;
                 }
                 Some(Err(e)) => {
@@ -543,7 +554,14 @@ async fn supervise(
                 Some(Ok(Message::Data(data))) => {
                     if let Some(tx) = &input {
                         if tx.send(data).await.is_err() {
-                            input = None; // the child closed its stdin
+                            // The queue will get closed by pump_input (by that function dropping
+                            // `input_rx`) whenever it tries to write an already-queued message to stdin,
+                            // but discovers it has already been closed on the other end (either explicitly
+                            // by the child/descendant processes, or by the kernel on process clean-up).
+                            //
+                            // This is not a real error.  We just ignore any further data that the
+                            // client sends, for there is nothing on the other side to read it.
+                            input = None;
                         }
                     }
                 }
@@ -578,16 +596,17 @@ async fn supervise(
 /// Copying stops when `rx` reaches EOF, or writing to the child fails.
 ///
 /// `stdin` is dropped at the end of the copying by this function. If it is
-/// a pipe, that closes our end of the pipe and the child process reads EOF.
+/// a pipe, that closes this process's end of the pipe,
+/// and the child process reads EOF.
 ///
 /// On the other hand, if `stdin` is a pty slave, dropping it does not
 /// cause the child process to get EOF.  The pty master stays open,
-/// so the child simply gets no more input, as with OpenSSH.  Note
+/// so the child process simply gets no more input, as with OpenSSH.  Note
 /// that a command like `ssh -tt ‹host› cat < /dev/null` does hang,
 /// while `ssh ‹host› cat < /dev/null` does not.
 ///
-/// Pumping stdin needs to read from an MPSC queue and not directly from the
-/// SSH channel is necessary to avoid head-of-line blocking when the child
+/// Pumping stdin needs to read from an MPSC queue, and not directly from the
+/// SSH channel, to avoid head-of-line blocking when the child
 /// process stops reading stdin.   Otherwise, `write_all(…).await` would
 /// asynchronously wait, but further messages from the client on the same
 /// SSH channel that are unrelated to the stdin pump,
@@ -639,10 +658,10 @@ async fn pump_input(mut rx: mpsc::Receiver<Bytes>, mut stdin: impl AsyncWrite + 
 ///
 /// Generally, in the contexts where an invocation of this function participates
 /// in the SSH channel, there are other participants that need to send to the same
-/// channel, e.g. pumping both stdout and stderr, plus sending exit-status messages
+/// channel, e.g. pumping both stdout and stderr, plus sending `exit-status` messages
 /// or replies to the client's other requests.  But the sender to the channel
 /// must have a unique owner.  Even without multi-threading, tasks may be
-/// concurrently executing (some awaiting in the middle).  A MPSC queue effectively
+/// concurrently executing (some awaiting in the middle).  An MPSC queue effectively
 /// serializes and orders the messages to accommodate concurrent tasks.
 pub async fn pump_output(
     mut from: impl AsyncRead + Unpin,
