@@ -4,6 +4,8 @@ Shion is an implementation of a [Secure Shell (SSH)](https://en.wikipedia.org/wi
 intended for clients that are AI agents, all running under one designated unprivileged user on the host
 system.
 
+![](art/mascot1.jpeg)
+
 ## Primary use case
 
 The client sessions may be sandboxed with wrapper programs like [Bubblewrap](https://github.com/containers/bubblewrap).
